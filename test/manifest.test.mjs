@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeProject, ok, readJson, run, writeJson } from '../lib/helpers.mjs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { CLI, REPO, makeProject, ok, readJson, run, writeJson } from '../lib/helpers.mjs';
 
 test('init writes a valid manifest and empty lock', (t) => {
   const root = makeProject(t);
@@ -58,4 +61,36 @@ test('manifest validation rejects traversal and malformed fields', (t) => {
   result = run(root, 'verify');
   assert.notEqual(result.status, 0);
   assert.match(result.output, /dependencies must be an object/);
+});
+
+test('mutations from an uninitialized directory never touch the tool repo', () => {
+  const bare = mkdtempSync(path.join(tmpdir(), 'opurom-pkg-bare-'));
+  const before = readFileSync(path.join(REPO, 'opurom.json'), 'utf8');
+  try {
+    const install = run(bare, 'install', 'opurom-ui@0.1.0');
+    assert.notEqual(install.status, 0, 'install outside a project must fail');
+    assert.match(install.output, /no opurom\.json|init/i);
+    const add = run(bare, 'add', 'opurom-ui@0.1.0');
+    assert.notEqual(add.status, 0, 'add outside a project must fail');
+    assert.match(add.output, /no opurom\.json|init/i);
+    assert.equal(readFileSync(path.join(REPO, 'opurom.json'), 'utf8'), before,
+      'the packaged manifest must not be rewritten');
+    assert.equal(existsSync(path.join(bare, 'opurom.json')), false,
+      'a failed mutation must not create files');
+  } finally {
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+test('init in a truly empty directory writes there, not into the tool repo', () => {
+  const bare = mkdtempSync(path.join(tmpdir(), 'opurom-pkg-init-'));
+  const before = readFileSync(path.join(REPO, 'opurom.json'), 'utf8');
+  try {
+    const result = ok(bare, 'init', 'fresh-app');
+    assert.match(result.stdout, /initialized fresh-app/);
+    assert.equal(readJson(bare, 'opurom.json').name, 'fresh-app');
+    assert.equal(readFileSync(path.join(REPO, 'opurom.json'), 'utf8'), before);
+  } finally {
+    rmSync(bare, { recursive: true, force: true });
+  }
 });
