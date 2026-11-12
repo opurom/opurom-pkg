@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// OPUROM offline package CLI: init | add | remove | list | verify | lock |
-// sign | registry-server | publish | install. Node builtins only.
+// OPUROM package CLI: local registry and GitHub-backed signed releases. Node builtins only.
 import { createHash } from 'node:crypto';
 import {
   closeSync,
@@ -28,6 +27,21 @@ import {
   verifyBytes,
   writeSignature,
 } from '../lib/signing.mjs';
+import {
+  ArchiveError,
+  MAX_ARCHIVE_BYTES,
+  assertSafePath,
+  createPackageArchive,
+  readPackageArchive,
+} from '../lib/package-archive.mjs';
+import {
+  GitHubRegistryError,
+  RegistryNetworkError,
+  assetNames,
+  createGithubMockServer,
+  createGithubRegistry,
+  parseRepository,
+} from '../lib/github-registry.mjs';
 import {
   closeServer,
   createRegistryServer,
@@ -67,12 +81,18 @@ const USAGE = `usage: opurom-pkg <command>
   verify [--signed]       recompute SHA-256 of every locked file
   lock                    regenerate deterministic opurom.lock
   sign                    write detached Ed25519 signatures
-  registry-server [--port N]  serve registry/ on loopback HTTP
-  publish <name>@<version>    publish a local package over loopback HTTP
-  install <name>@<version>    install an exact package over loopback HTTP
+  registry-server [--port N]       serve registry/ on loopback HTTP
+  github-registry-server [--port N] serve a GitHub API mock on loopback
+  publish <name>@<version>         publish over loopback HTTP
+  install <name>@<version>         install over loopback HTTP
+  search --github <owner/repo> [name]    list signed Release assets
+  publish --github <owner/repo> <name>@<version>
+  install --github <owner/repo> <name>@<version>
 
-Run from the project root. Only exact x.y.z versions and loopback HTTP are
-supported. OPUROM_REGISTRY_URL overrides http://127.0.0.1:4873.`;
+Run from the project root. Only exact x.y.z versions are supported.
+Local publish/install use OPUROM_REGISTRY_URL (loopback HTTP only).
+--github uses https://api.github.com, or OPUROM_GITHUB_API_URL for a loopback mock.
+Publishing reads OPR_GITHUB_TOKEN from the environment only.`;
 
 class CliError extends Error {
   constructor(message, code = 1) {
@@ -117,6 +137,37 @@ function registryPath(name, version) {
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+// The publish token is read from this single environment variable and is never persisted.
+function githubToken() {
+  return process.env.OPR_GITHUB_TOKEN || null;
+}
+
+function redactToken(text) {
+  const token = githubToken();
+  return token ? text.split(token).join('[REDACTED]') : text;
+}
+
+function githubRegistry() {
+  return createGithubRegistry({ token: githubToken() });
+}
+
+function githubArgs(command, rest, expected) {
+  if (rest[0] !== '--github' || typeof rest[1] !== 'string' || rest[1].length === 0) {
+    throw new CliError(`${command} needs --github <owner/repo>`, 2);
+  }
+  try {
+    parseRepository(rest[1]);
+  } catch (error) {
+    throw new CliError(errorText(error), 2);
+  }
+  const positional = rest.slice(2);
+  const allowed = Array.isArray(expected) ? expected : [expected];
+  if (!allowed.includes(positional.length)) {
+    throw new CliError(`${command} --github needs ${allowed.join(' or ')} positional argument(s)`, 2);
+  }
+  return { repository: rest[1], positional };
 }
 
 function assertInside(absolute, relative, label) {
@@ -732,7 +783,7 @@ function packageFilesForPublish(name, version) {
   return pkg;
 }
 
-async function commandRegistryServer(rest) {
+async function commandRegistryServer(rest, github = false) {
   let port = 0;
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index];
@@ -744,15 +795,17 @@ async function commandRegistryServer(rest) {
       raw = argument.slice('--port='.length);
     }
     if (raw === null || !/^\d+$/.test(raw)) {
-      throw new CliError(`unknown option for registry-server: ${argument}`, 2);
+      throw new CliError(`unknown option for ${github ? 'github-registry-server' : 'registry-server'}: ${argument}`, 2);
     }
     const value = Number(raw);
     if (value > 65535) throw new CliError(`invalid port: ${raw}`);
     port = value;
   }
-  const server = createRegistryServer(ROOT);
+  const server = github ? createGithubMockServer() : createRegistryServer(ROOT);
   const bound = await listenLoopback(server, port);
-  process.stdout.write(`registry listening on http://127.0.0.1:${bound}\n`);
+  process.stdout.write(
+    `${github ? 'github registry' : 'registry'} listening on http://127.0.0.1:${bound}\n`,
+  );
   const stop = async () => {
     await closeServer(server);
     process.exit(0);
@@ -792,12 +845,39 @@ async function commandPublish(spec) {
 }
 
 // Writes an installed file inside the project root, creating parent directories.
-function writeInstalledFile(relative, bytes) {
+function writeInstalledFile(relative, bytes, expectedSha256 = null) {
   const parts = assertRelative(relative, `installed file ${relative}`);
   const absolute = path.resolve(ROOT, ...parts);
   assertInside(absolute, relative, `installed file ${relative}`);
+  if (expectedSha256 !== null && sha256(bytes) !== expectedSha256) {
+    throw new CliError(`sha256 mismatch before writing ${relative}`);
+  }
+  let current = ROOT;
+  for (const part of parts.slice(0, -1)) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      if (error.code === 'ENOENT') break;
+      throw new CliError(`cannot stat ${relative}: ${error.message}`);
+    }
+    if (stat.isSymbolicLink()) {
+      throw new CliError(`unsafe installed file: ${relative} (symlink rejected)`);
+    }
+    if (!stat.isDirectory()) throw new CliError(`not a directory: ${relative}`);
+  }
   mkdirSync(path.dirname(absolute), { recursive: true });
-  writeFileSync(absolute, bytes);
+  let fd;
+  try {
+    fd = openSync(absolute, WRITE_FLAGS, 0o600);
+    writeFileSync(fd, bytes);
+  } catch (error) {
+    if (error.code === 'ELOOP') throw new CliError(`unsafe installed file: ${relative} (symlink rejected)`);
+    throw new CliError(`cannot write ${relative}: ${error.message}`);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 async function commandInstall(spec) {
@@ -823,6 +903,84 @@ async function commandInstall(spec) {
   const added = applyDependency(name, version);
   process.stdout.write(
     `installed ${name}@${version} (${added.files.length} files) from ${base}\n`,
+  );
+}
+
+async function commandPublishGithub(repository, spec) {
+  const token = githubToken();
+  if (!token) {
+    process.stdout.write('SKIP missing OPR_GITHUB_TOKEN; no GitHub Release was created\n');
+    return;
+  }
+  const { name, version } = parseSpec(spec, 'publish');
+  const pkg = collectPackage(name, version);
+  const files = pkg.files.map((file) => {
+    const target = resolveContained(file.path, `registry file ${file.path}`, 'file');
+    const bytes = readNoFollow(target.absolute, file.path);
+    const relative = assertSafePath(file.path.slice(pkg.path.length + 1));
+    if (sha256(bytes) !== file.sha256) throw new CliError(`local sha256 mismatch: ${file.path}`);
+    return { path: relative, bytes, sha256: file.sha256 };
+  });
+  const archive = createPackageArchive({ name, version, files });
+  if (archive.length > MAX_ARCHIVE_BYTES) throw new CliError('archive exceeds bounded size');
+  const { privateKey } = loadOrCreateKeypair(ROOT);
+  const names = assetNames(name, version);
+  const signature = signBytes(privateKey, names.archive, archive);
+  const result = await createGithubRegistry({ token }).publish({
+    repository,
+    name,
+    version,
+    archive,
+    signature,
+    digest: sha256(archive),
+  });
+  process.stdout.write(
+    `published ${name}@${version} release=${result.releaseUrl} assets=${result.asset},${result.signature}\n`,
+  );
+}
+
+async function commandSearchGithub(repository, positional) {
+  const name = positional[0] ?? null;
+  if (name !== null) validateName(name, 'package name');
+  const rows = await githubRegistry().search({ repository, name });
+  if (rows.length === 0) {
+    process.stdout.write(`no signed packages found in ${repository}\n`);
+    return;
+  }
+  for (const row of rows) {
+    process.stdout.write(
+      `${row.name}@${row.version} release=${row.releaseUrl} asset=${row.asset}\n`,
+    );
+  }
+}
+
+async function commandInstallGithub(repository, spec) {
+  const { name, version } = parseSpec(spec, 'install');
+  const payload = await githubRegistry().download({ repository, name, version });
+  const names = assetNames(name, version);
+  const publicKey = readPublicKey(ROOT);
+  let signed = false;
+  try {
+    signed = verifyBytes(publicKey, names.archive, payload.archive, payload.signature);
+  } catch {
+    signed = false;
+  }
+  if (!signed) throw new CliError(`invalid signature: ${names.signature}`);
+  const digest = sha256(payload.archive);
+  if (digest !== payload.digest) {
+    throw new CliError(
+      `sha256 mismatch: ${names.archive} (expected ${payload.digest}, got ${digest})`,
+    );
+  }
+  const { files } = readPackageArchive(payload.archive, { name, version });
+  const packageRelative = registryPath(name, version);
+  for (const file of files) {
+    const relative = path.posix.join(packageRelative, assertSafePath(file.path));
+    writeInstalledFile(relative, file.bytes, file.sha256);
+  }
+  const added = applyDependency(name, version);
+  process.stdout.write(
+    `installed ${name}@${version} (${added.files.length} files) from ${payload.releaseUrl} (${payload.asset})\n`,
   );
 }
 
@@ -869,21 +1027,44 @@ async function main(argv) {
     commandSign();
   } else if (command === 'registry-server') {
     await commandRegistryServer(rest);
+  } else if (command === 'github-registry-server') {
+    await commandRegistryServer(rest, true);
   } else if (command === 'publish') {
-    await commandPublish(oneArgument(command, rest));
+    if (rest[0] === '--github') {
+      const { repository, positional } = githubArgs(command, rest, 1);
+      await commandPublishGithub(repository, positional[0]);
+    } else {
+      await commandPublish(oneArgument(command, rest));
+    }
   } else if (command === 'install') {
-    await commandInstall(oneArgument(command, rest));
+    if (rest[0] === '--github') {
+      const { repository, positional } = githubArgs(command, rest, 1);
+      await commandInstallGithub(repository, positional[0]);
+    } else {
+      await commandInstall(oneArgument(command, rest));
+    }
+  } else if (command === 'search') {
+    const { repository, positional } = githubArgs(command, rest, [0, 1]);
+    await commandSearchGithub(repository, positional);
   } else {
     throw new CliError(`unknown command: ${command}\n${USAGE}`, 2);
   }
 }
 
 main(process.argv.slice(2)).catch((error) => {
+  if (error instanceof RegistryNetworkError) {
+    process.stdout.write(`SKIP network unavailable: ${redactToken(error.reason)}\n`);
+    return;
+  }
   const code = error instanceof CliError ? error.code : 1;
   const text =
-    error instanceof CliError || error instanceof SigningError || error instanceof HttpError
+    error instanceof CliError ||
+    error instanceof SigningError ||
+    error instanceof HttpError ||
+    error instanceof GitHubRegistryError ||
+    error instanceof ArchiveError
       ? error.message
       : error?.stack ?? String(error);
-  process.stderr.write(`error: ${text}\n`);
+  process.stderr.write(`error: ${redactToken(text)}\n`);
   process.exitCode = code;
 });
