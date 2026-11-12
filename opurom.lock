@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "packages": [
+    {
+      "name": "opurom-data",
+      "version": "0.1.0",
+      "path": "registry/opurom-data/0.1.0",
+      "sha256": "a3ba620cc705e7737803405d855fc86b48b352fcb748c00edd84bb83f60a1e93",
+      "files": [
+        {
+          "path": "registry/opurom-data/0.1.0/opurom-pkg.json",
+          "sha256": "0faba75fed210aa666524ed9f028b89d2ab985482436ea617ef1769ced72a79b"
+        },
+        {
+          "path": "registry/opurom-data/0.1.0/query.opu",
+          "sha256": "d13eb836471c34291e7c6f6a8d0b59a63f49a3cccf4a60803b6507f65545afbb"
+        },
+        {
+          "path": "registry/opurom-data/0.1.0/record.opu",
+          "sha256": "2f03298b07ad0217b9e847ce0ce65515e6291af2f635222ebfb0375b3baad395"
+        }
+      ]
+    },
+    {
+      "name": "opurom-ui",
+      "version": "0.1.0",
+      "path": "registry/opurom-ui/0.1.0",
+      "sha256": "8e3794b5d41ba418a5443d8e49385261fc6f00dd65f4f935a66c3be8cdd566d1",
+      "files": [
+        {
+          "path": "registry/opurom-ui/0.1.0/button.opu",
+          "sha256": "5de6d94cb4a7fd6d4f7579777a82f1bdefbe921fb75082aad55742446a8b5a94"
+        },
+        {
+          "path": "registry/opurom-ui/0.1.0/card.opu",
+          "sha256": "5b5780958f97c36bf0c5baef62c2e7d47206917457667d8fc61a408a1be5a3aa"
+        },
+        {
+          "path": "registry/opurom-ui/0.1.0/opurom-pkg.json",
+          "sha256": "d63192ee0f4b469edfb869e2bdb8f8be9bf4e0b5184788689c477c1b5b3a4f9c"
+        }
+      ]
+    }
+  ]
+}

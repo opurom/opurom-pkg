@@ -1,0 +1,9 @@
+{
+  "name": "opurom-pkg",
+  "version": "0.1.0",
+  "moduleRoots": ["registry"],
+  "dependencies": {
+    "opurom-data": "0.1.0",
+    "opurom-ui": "0.1.0"
+  }
+}
