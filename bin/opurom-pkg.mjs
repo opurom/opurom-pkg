@@ -49,13 +49,16 @@ import {
 } from '../lib/registry.mjs';
 import { HttpError, assertIntegrity, expectOk, request } from '../lib/http-client.mjs';
 
-// The project root is the current directory, or the package directory that owns
-// this script when the CLI is invoked from outside the project.
+// Mutations must never fall back to the tool's own repo: an uninitialized
+// working directory would otherwise silently rewrite the packaged manifest.
+const MUTATING = new Set(['init', 'add', 'remove', 'install', 'lock', 'sign', 'publish']);
+
 function resolveRoot() {
   const current = realpathSync(process.cwd());
+  const command = process.argv[2];
+  if (MUTATING.has(command)) return current;
   if (existsSync(path.join(current, 'opurom.json'))) return current;
   const packaged = path.resolve(import.meta.dirname, '..');
-  // A fresh project directory must stay usable for init.
   if (existsSync(path.join(current, 'registry'))) return current;
   if (existsSync(path.join(packaged, 'opurom.json'))) return packaged;
   return current;
@@ -990,6 +993,9 @@ async function main(argv) {
     process.stdout.write(`${USAGE}\n`);
     process.exitCode = 2;
     return;
+  }
+  if (MUTATING.has(command) && command !== 'init' && !existsSync(path.join(ROOT, 'opurom.json'))) {
+    throw new CliError(`no opurom.json in ${ROOT}; run 'opurom-pkg init <name>' first`);
   }
   if (command === 'help' || command === '--help' || command === '-h') {
     process.stdout.write(`${USAGE}\n`);
