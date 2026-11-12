@@ -2,7 +2,7 @@
   "name": "opurom-pkg",
   "version": "0.1.0",
   "private": true,
-  "description": "Offline OPUROM package manager using Node builtins only",
+  "description": "OPUROM package manager with Ed25519 signing and a loopback registry",
   "type": "module",
   "bin": {
     "opurom-pkg": "bin/opurom-pkg.mjs"

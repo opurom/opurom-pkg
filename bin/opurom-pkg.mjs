@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-// OPUROM offline package CLI: init | add | remove | list | verify | lock. Node builtins only.
+// OPUROM offline package CLI: init | add | remove | list | verify | lock |
+// sign | registry-server | publish | install. Node builtins only.
 import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
   existsSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -16,8 +18,36 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import {
+  SIG_EXT,
+  SigningError,
+  loadOrCreateKeypair,
+  readPublicKey,
+  readSignature,
+  signBytes,
+  verifyBytes,
+  writeSignature,
+} from '../lib/signing.mjs';
+import {
+  closeServer,
+  createRegistryServer,
+  listenLoopback,
+} from '../lib/registry.mjs';
+import { HttpError, assertIntegrity, expectOk, request } from '../lib/http-client.mjs';
 
-const ROOT = realpathSync(process.cwd());
+// The project root is the current directory, or the package directory that owns
+// this script when the CLI is invoked from outside the project.
+function resolveRoot() {
+  const current = realpathSync(process.cwd());
+  if (existsSync(path.join(current, 'opurom.json'))) return current;
+  const packaged = path.resolve(import.meta.dirname, '..');
+  // A fresh project directory must stay usable for init.
+  if (existsSync(path.join(current, 'registry'))) return current;
+  if (existsSync(path.join(packaged, 'opurom.json'))) return packaged;
+  return current;
+}
+
+const ROOT = resolveRoot();
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const READ_FLAGS = constants.O_RDONLY | NOFOLLOW;
 const WRITE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NOFOLLOW;
@@ -25,6 +55,8 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 // shortcut: exact x.y.z versions only, upgrade when ranges or prerelease tags are needed.
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+// Local mock registry only: loopback HTTP, no TLS, no remote hosts.
+const DEFAULT_REGISTRY_URL = 'http://127.0.0.1:4873';
 
 const USAGE = `usage: opurom-pkg <command>
 
@@ -32,10 +64,15 @@ const USAGE = `usage: opurom-pkg <command>
   add <name>@<version>    resolve from registry/ and refresh opurom.lock
   remove <name>           remove a dependency and refresh opurom.lock
   list                    show packages in opurom.lock
-  verify                  recompute SHA-256 of every locked file
+  verify [--signed]       recompute SHA-256 of every locked file
   lock                    regenerate deterministic opurom.lock
+  sign                    write detached Ed25519 signatures
+  registry-server [--port N]  serve registry/ on loopback HTTP
+  publish <name>@<version>    publish a local package over loopback HTTP
+  install <name>@<version>    install an exact package over loopback HTTP
 
-Run from the project root. Only exact x.y.z versions and local files are supported.`;
+Run from the project root. Only exact x.y.z versions and loopback HTTP are
+supported. OPUROM_REGISTRY_URL overrides http://127.0.0.1:4873.`;
 
 class CliError extends Error {
   constructor(message, code = 1) {
@@ -196,11 +233,10 @@ function preparedWrite(relative) {
   return absolute;
 }
 
-function writeJsonFile(relative, value) {
+function writeTextFile(relative, text) {
   const target = preparedWrite(relative);
   const temporaryRelative = `${relative}.tmp`;
   const temporary = preparedWrite(temporaryRelative);
-  const text = stableJson(value);
   try {
     const fd = openSync(temporary, WRITE_FLAGS, 0o600);
     try {
@@ -217,6 +253,10 @@ function writeJsonFile(relative, value) {
     }
     throw new CliError(`cannot write ${relative}: ${error.message}`);
   }
+}
+
+function writeJsonFile(relative, value) {
+  writeTextFile(relative, stableJson(value));
 }
 
 function validateName(name, label) {
@@ -332,6 +372,8 @@ function walkFiles(relativeDirectory, absoluteDirectory) {
   entries.sort((left, right) => compareStrings(left.name, right.name));
   const files = [];
   for (const entry of entries) {
+    // Detached signatures sit next to files but are not package content.
+    if (entry.name.endsWith(SIG_EXT)) continue;
     assertRelative(entry.name, 'filesystem name');
     const relative = path.posix.join(relativeDirectory, entry.name);
     assertRelative(relative, 'registry path');
@@ -415,10 +457,10 @@ function writeProjectState(manifestData, dependencies, packages) {
   writeJsonFile('opurom.lock', { version: 1, packages });
 }
 
-function parseSpec(spec) {
+function parseSpec(spec, command = 'add') {
   const at = spec.lastIndexOf('@');
   if (at <= 0 || at === spec.length - 1) {
-    throw new CliError('add needs <name>@<version>, for example opurom-ui@0.1.0');
+    throw new CliError(`${command} needs <name>@<version>, for example opurom-ui@0.1.0`);
   }
   const name = spec.slice(0, at);
   const version = spec.slice(at + 1);
@@ -444,8 +486,8 @@ function commandInit(name) {
   process.stdout.write(`initialized ${name}\n`);
 }
 
-function commandAdd(spec) {
-  const { name, version } = parseSpec(spec);
+// Updates opurom.json and opurom.lock after a dependency became available locally.
+function applyDependency(name, version) {
   const { data, dependencies } = readManifestFile();
   const byName = new Map(dependencies);
   byName.set(name, version);
@@ -454,7 +496,12 @@ function commandAdd(spec) {
   );
   const packages = buildPackages(nextDependencies);
   writeProjectState(data, nextDependencies, packages);
-  const added = packages.find((pkg) => pkg.name === name);
+  return packages.find((pkg) => pkg.name === name);
+}
+
+function commandAdd(spec) {
+  const { name, version } = parseSpec(spec, 'add');
+  const added = applyDependency(name, version);
   process.stdout.write(`added ${name}@${version} (${added.files.length} files)\n`);
 }
 
@@ -593,6 +640,192 @@ function noArguments(command, rest) {
   if (rest.length !== 0) throw new CliError(`${command} takes no arguments`, 2);
 }
 
+// --- signing -------------------------------------------------------------
+
+// Signs every locked package file plus the lockfile itself.
+function commandSign() {
+  const packages = readLockFile();
+  const { privateKey, publicKeyPath, created } = loadOrCreateKeypair(ROOT);
+  const written = [];
+  for (const pkg of packages) {
+    for (const file of pkg.files) {
+      const target = resolveContained(file.path, `locked file ${file.path}`, 'file');
+      const bytes = readNoFollow(target.absolute, file.path);
+      const signature = signBytes(privateKey, file.path, bytes);
+      writeSignature(ROOT, file.path, signature);
+      written.push(file.path);
+    }
+  }
+  const lockBytes = readNoFollow(path.join(ROOT, 'opurom.lock'), 'opurom.lock');
+  writeSignature(ROOT, 'opurom.lock', signBytes(privateKey, 'opurom.lock', lockBytes));
+  written.push('opurom.lock');
+  process.stdout.write(
+    `signed ${written.length} files with ${path.basename(publicKeyPath)}${
+      created ? ' (new keypair created)' : ''
+    }\n`,
+  );
+}
+
+// Verifies one detached signature against the file on disk.
+function verifySignatureFile(publicKey, relativePath) {
+  const signature = readSignature(ROOT, relativePath);
+  if (!signature) {
+    return [`missing signature: ${relativePath}${SIG_EXT}`];
+  }
+  let target;
+  try {
+    target = resolveContained(relativePath, `signed file ${relativePath}`, 'file');
+  } catch (error) {
+    return [errorText(error)];
+  }
+  const bytes = readNoFollow(target.absolute, relativePath);
+  if (!verifyBytes(publicKey, relativePath, bytes, signature)) {
+    return [`invalid signature: ${relativePath}${SIG_EXT}`];
+  }
+  return [];
+}
+
+function verifySignedPackages(packages) {
+  let publicKey;
+  try {
+    publicKey = readPublicKey(ROOT);
+  } catch (error) {
+    return {
+      checks: [{ label: '<signatures>', detail: '', errors: [error.message] }],
+    };
+  }
+  const checks = [];
+  for (const pkg of packages) {
+    const errors = [];
+    for (const file of pkg.files) {
+      errors.push(...verifySignatureFile(publicKey, file.path));
+    }
+    checks.push({
+      label: `${pkg.name}@${pkg.version}`,
+      detail: `${pkg.files.length} files signed`,
+      errors,
+    });
+  }
+  const lockErrors = verifySignatureFile(publicKey, 'opurom.lock');
+  checks.push({
+    label: 'opurom.lock',
+    detail: 'lockfile signed',
+    errors: lockErrors,
+  });
+  return { checks };
+}
+
+function commandVerifySigned(packages) {
+  const { checks } = verifySignedPackages(packages);
+  report(checks);
+}
+
+// --- registry ------------------------------------------------------------
+
+function registryUrl() {
+  const raw = process.env.OPUROM_REGISTRY_URL || DEFAULT_REGISTRY_URL;
+  return raw.endsWith('/') ? raw : `${raw}/`;
+}
+
+function packageFilesForPublish(name, version) {
+  const pkg = collectPackage(name, version);
+  return pkg;
+}
+
+async function commandRegistryServer(rest) {
+  let port = 0;
+  for (let index = 0; index < rest.length; index += 1) {
+    const argument = rest[index];
+    let raw = null;
+    if (argument === '--port') {
+      raw = rest[index + 1];
+      index += 1;
+    } else if (argument.startsWith('--port=')) {
+      raw = argument.slice('--port='.length);
+    }
+    if (raw === null || !/^\d+$/.test(raw)) {
+      throw new CliError(`unknown option for registry-server: ${argument}`, 2);
+    }
+    const value = Number(raw);
+    if (value > 65535) throw new CliError(`invalid port: ${raw}`);
+    port = value;
+  }
+  const server = createRegistryServer(ROOT);
+  const bound = await listenLoopback(server, port);
+  process.stdout.write(`registry listening on http://127.0.0.1:${bound}\n`);
+  const stop = async () => {
+    await closeServer(server);
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+}
+
+async function commandPublish(spec) {
+  const { name, version } = parseSpec(spec, 'publish');
+  const pkg = collectPackage(name, version);
+  const base = registryUrl();
+  for (const file of pkg.files) {
+    const target = resolveContained(file.path, `registry file ${file.path}`, 'file');
+    const bytes = readNoFollow(target.absolute, file.path);
+    const digest = sha256(bytes);
+    const fileName = file.path.slice(pkg.path.length + 1);
+    const url = new URL(`packages/${name}/${version}/${fileName}`, base);
+    const response = await request(url, {
+      method: 'PUT',
+      body: bytes,
+      headers: { 'x-content-sha256': digest },
+    });
+    if (response.status !== 200 && response.status !== 201) {
+      throw new CliError(
+        `publish ${name}@${version} (${fileName}) failed with status ${response.status}: ${response.body
+          .toString('utf8')
+          .trim()}`,
+      );
+    }
+    const result = JSON.parse(response.body.toString('utf8'));
+    if (result.sha256 !== digest) {
+      throw new CliError(`publish integrity mismatch for ${fileName}`);
+    }
+  }
+  process.stdout.write(`published ${name}@${version} (${pkg.files.length} files) to ${base}\n`);
+}
+
+// Writes an installed file inside the project root, creating parent directories.
+function writeInstalledFile(relative, bytes) {
+  const parts = assertRelative(relative, `installed file ${relative}`);
+  const absolute = path.resolve(ROOT, ...parts);
+  assertInside(absolute, relative, `installed file ${relative}`);
+  mkdirSync(path.dirname(absolute), { recursive: true });
+  writeFileSync(absolute, bytes);
+}
+
+async function commandInstall(spec) {
+  const { name, version } = parseSpec(spec, 'install');
+  const base = registryUrl();
+  const manifestUrl = new URL(`packages/${name}/${version}/`, base);
+  const manifestResponse = expectOk(
+    await request(manifestUrl),
+    `install ${name}@${version} (package listing)`,
+  );
+  const listing = JSON.parse(manifestResponse.body.toString('utf8'));
+  if (!Array.isArray(listing.files) || listing.files.length === 0) {
+    throw new CliError(`registry returned no files for ${name}@${version}`);
+  }
+  const packageRelative = registryPath(name, version);
+  for (const entry of listing.files) {
+    const relative = path.posix.join(packageRelative, entry.path);
+    const url = new URL(`packages/${name}/${version}/${entry.path}`, base);
+    const response = expectOk(await request(url), `install ${name}@${version} (${entry.path})`);
+    assertIntegrity(response, entry.sha256, `install ${name}@${version} (${entry.path})`);
+    writeInstalledFile(relative, response.body);
+  }
+  const added = applyDependency(name, version);
+  process.stdout.write(
+    `installed ${name}@${version} (${added.files.length} files) from ${base}\n`,
+  );
+}
+
 async function main(argv) {
   const [command, ...rest] = argv;
   if (!command) {
@@ -614,11 +847,32 @@ async function main(argv) {
     noArguments(command, rest);
     commandList();
   } else if (command === 'verify') {
-    noArguments(command, rest);
-    commandVerify();
+    if (rest.length === 0) {
+      commandVerify();
+    } else if (rest.length === 1 && rest[0] === '--signed') {
+      let packages;
+      try {
+        packages = readLockFile();
+      } catch (error) {
+        report([{ label: '<lock>', detail: '', errors: [errorText(error)] }]);
+        return;
+      }
+      commandVerifySigned(packages);
+    } else {
+      throw new CliError(`verify takes no arguments or --signed`, 2);
+    }
   } else if (command === 'lock') {
     noArguments(command, rest);
     commandLock();
+  } else if (command === 'sign') {
+    noArguments(command, rest);
+    commandSign();
+  } else if (command === 'registry-server') {
+    await commandRegistryServer(rest);
+  } else if (command === 'publish') {
+    await commandPublish(oneArgument(command, rest));
+  } else if (command === 'install') {
+    await commandInstall(oneArgument(command, rest));
   } else {
     throw new CliError(`unknown command: ${command}\n${USAGE}`, 2);
   }
@@ -626,7 +880,10 @@ async function main(argv) {
 
 main(process.argv.slice(2)).catch((error) => {
   const code = error instanceof CliError ? error.code : 1;
-  const text = error instanceof CliError ? error.message : error?.stack ?? String(error);
+  const text =
+    error instanceof CliError || error instanceof SigningError || error instanceof HttpError
+      ? error.message
+      : error?.stack ?? String(error);
   process.stderr.write(`error: ${text}\n`);
   process.exitCode = code;
 });
