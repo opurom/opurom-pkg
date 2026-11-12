@@ -1,0 +1,9 @@
+{
+  "name": "opurom-data",
+  "version": "0.1.0",
+  "files": [
+    "opurom-pkg.json",
+    "query.opu",
+    "record.opu"
+  ]
+}

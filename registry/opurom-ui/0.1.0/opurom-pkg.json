@@ -1,0 +1,9 @@
+{
+  "name": "opurom-ui",
+  "version": "0.1.0",
+  "files": [
+    "button.opu",
+    "card.opu",
+    "opurom-pkg.json"
+  ]
+}
