@@ -26,7 +26,7 @@ node bin/opurom-pkg.mjs publish --github opurom/opurom-pkg opurom-ui@0.1.0
 node bin/opurom-pkg.mjs install --github opurom/opurom-pkg opurom-ui@0.1.0
 ```
 
-`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one `name@x.y.z` pin, or a SemVer 2.0 comparator range such as `>=0.1.0 <0.2.0`, from `registry/<name>/<version>/` and refreshes both the manifest and lock. A range selects the highest stable version by SemVer precedence and pins that exact version in `opurom.lock`; the manifest keeps the range. Prereleases never satisfy a stable range and are only reachable through an exact pin or a range with a prerelease comparator for the same `major.minor.patch`. Versions equal by precedence (differing only in build metadata) are ordered by raw text, so selection is deterministic. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged.
+`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one `name@x.y.z` pin, or a SemVer 2.0 comparator range such as `>=0.1.0 <0.2.0`, from `registry/<name>/<version>/` and refreshes both the manifest and lock. A range selects the highest stable version by SemVer precedence and pins that exact version in `opurom.lock`; the manifest keeps the range. Prereleases never satisfy a stable range and are only reachable through an exact pin or a range with a prerelease comparator for the same `major.minor.patch`. Versions equal by precedence (differing only in build metadata) are ordered by raw text, so selection is deterministic. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry and refreshes the recorded manifest digest. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged.
 
 Commands run against the current directory. When the current directory has no `opurom.json` and no
 `registry/`, the CLI falls back to the package directory that owns the script, so
@@ -53,6 +53,7 @@ Commands run against the current directory. When the current directory has no `o
 ```json
 {
   "version": 1,
+  "manifestSha256": "...",
   "packages": [
     {
       "name": "opurom-data",
@@ -64,6 +65,8 @@ Commands run against the current directory. When the current directory has no `o
   ]
 }
 ```
+
+`manifestSha256` is the SHA-256 of the `opurom.json` bytes at lock or install time. Every command that writes the lock (`init`, `add`, `remove`, `install`, `lock`) records it, so `lock` refreshes it after a legitimate manifest edit and `lock --check` also reports a manifest whose bytes changed.
 
 Each registry package has `opurom-pkg.json` with `name`, `version` and an exact `files` array, plus `.opu` module files. The CLI rejects registry metadata whose file list does not match the directory contents.
 
@@ -82,8 +85,13 @@ reuses the same keypair and rewrites the same signatures.
 
 `verify --signed` checks every locked file and the lockfile against `keys/opurom.pub`. It rejects a
 tampered file, a missing signature, a signature made by a different key, and a rewritten lockfile
-entry or tampered `opurom.lock.sig` (the detached signature no longer matches the lock bytes). `verify`
-without `--signed` checks hashes only and never looks at signatures.
+entry or tampered `opurom.lock.sig` (the detached signature no longer matches the lock bytes). Once
+the lockfile signature verifies, it also hashes `opurom.json` and compares it with the
+`manifestSha256` carried by that signed lockfile: any manifest edit since lock or install is reported
+as a manifest digest mismatch. Editing the digest to hide an edit changes the lockfile bytes and is
+refused as an invalid signature instead, and a lockfile with no digest is refused. After a legitimate
+edit, run `lock` to refresh the digest and `sign` again to re-sign the changed lockfile. `verify`
+without `--signed` checks hashes only and never looks at signatures or the manifest digest.
 
 The private key never leaves the project directory and is never printed. Nothing in this repository
 publishes a public key, so `verify --signed` proves only that the files match the local keypair, not
@@ -149,7 +157,11 @@ node --check bin/*.mjs lib/*.mjs test/*.mjs
 
 The suite uses temporary project roots and copies the local registry. It covers manifest validation,
 add/list/remove round trip, byte-stable lock regeneration, clean verification, tampered files, missing
-files, traversal paths, invalid versions, unknown packages and lock drift. The lock determinism tests
+files, traversal paths, invalid versions, unknown packages and lock drift. The manifest-integrity
+tests use a real loopback registry install, the signing helper and detached `opurom.lock.sig` bytes:
+they cover digest recording on lock, install, add and remove, refusal of an edited manifest, refresh
+by `lock` plus re-signing, a rewritten digest hidden by a stale signature, a tampered signature, a
+signed lock with no digest and a malformed digest. The lock determinism tests
 cover a current lock, a reformatted lock, changed registry bytes, manifest drift, an empty lock, a
 missing lock and an invalid option, and confirm that `lock --check` never rewrites the lockfile. The
 signing tests add the sign/verify round trip, tampered content, a wrong key, a missing signature,

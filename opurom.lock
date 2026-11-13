@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "manifestSha256": "13c4cac769d7b461c38fee18b239a59031f2367bfa3c1b01d3932ddce61029e7",
   "packages": [
     {
       "name": "opurom-data",
