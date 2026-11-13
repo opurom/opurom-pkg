@@ -9,6 +9,7 @@ Run each command from the project root:
 ```sh
 node bin/opurom-pkg.mjs init demo-app
 node bin/opurom-pkg.mjs add opurom-ui@0.1.0
+node bin/opurom-pkg.mjs add 'opurom-ui@>=0.1.0 <0.2.0'
 node bin/opurom-pkg.mjs list
 node bin/opurom-pkg.mjs verify
 node bin/opurom-pkg.mjs lock
@@ -25,7 +26,7 @@ node bin/opurom-pkg.mjs publish --github opurom/opurom-pkg opurom-ui@0.1.0
 node bin/opurom-pkg.mjs install --github opurom/opurom-pkg opurom-ui@0.1.0
 ```
 
-`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one exact `name@x.y.z` package from `registry/<name>/<version>/` and refreshes both the manifest and lock. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged.
+`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one `name@x.y.z` pin, or a SemVer 2.0 comparator range such as `>=0.1.0 <0.2.0`, from `registry/<name>/<version>/` and refreshes both the manifest and lock. A range selects the highest stable version by SemVer precedence and pins that exact version in `opurom.lock`; the manifest keeps the range. Prereleases never satisfy a stable range and are only reachable through an exact pin or a range with a prerelease comparator for the same `major.minor.patch`. Versions equal by precedence (differing only in build metadata) are ordered by raw text, so selection is deterministic. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged.
 
 Commands run against the current directory. When the current directory has no `opurom.json` and no
 `registry/`, the CLI falls back to the package directory that owns the script, so
@@ -33,7 +34,7 @@ Commands run against the current directory. When the current directory has no `o
 
 ## Files
 
-`opurom.json` declares exact local dependency versions:
+`opurom.json` declares exact local dependency pins or comparator ranges:
 
 ```json
 {
@@ -68,7 +69,7 @@ Each registry package has `opurom-pkg.json` with `name`, `version` and an exact 
 
 ## Trust boundary
 
-`verify` reads `opurom.json` and `opurom.lock`, compares manifest dependencies with locked versions, recomputes SHA-256 of every locked file, recomputes each package digest, checks for missing or extra files, and rejects absolute paths, `..` traversal and symlinks. All paths must resolve inside the project root. Any failure prints `FAIL` details and exits nonzero.
+`verify` reads `opurom.json` and `opurom.lock`, recomputes the deterministic winner for every dependency (an exact pin wins directly; a range must resolve to the version pinned in the lock), recomputes SHA-256 of every locked file, recomputes each package digest, checks for missing or extra files, and rejects absolute paths, `..` traversal and symlinks. All paths must resolve inside the project root. A lock entry pointing at any other version, including a prerelease that a stable range excludes, is reported as version drift. Any failure prints `FAIL` details and exits nonzero.
 
 `add`, `lock` and `verify` never import or run `.opu` files. They hash bytes only. SHA-256 is an integrity check, not publisher authenticity.
 
@@ -80,7 +81,8 @@ and the file bytes, so renaming a file breaks its signature. `sign` is idempoten
 reuses the same keypair and rewrites the same signatures.
 
 `verify --signed` checks every locked file and the lockfile against `keys/opurom.pub`. It rejects a
-tampered file, a missing signature, a signature made by a different key, and lock drift. `verify`
+tampered file, a missing signature, a signature made by a different key, and a rewritten lockfile
+entry or tampered `opurom.lock.sig` (the detached signature no longer matches the lock bytes). `verify`
 without `--signed` checks hashes only and never looks at signatures.
 
 The private key never leaves the project directory and is never printed. Nothing in this repository
@@ -155,7 +157,9 @@ registry `GET` and `404`, a publish/install round trip over real TCP against an 
 integrity mismatches, traversal rejection, bounded bodies and port release after shutdown. The GitHub
 tests add GitHub Release asset naming, mock publish/search/install over real TCP, signature and
 integrity rejection, wrong-key and missing-signature rejection, bounded-size and archive traversal
-rejection, and `SKIP` without a token or network.
+rejection, and `SKIP` without a token or network. The version-resolution tests use temporary
+registries with no network: exact pins, stable-range precedence, prerelease exclusion, deterministic
+selection and build-metadata ties, leading-zero rejection, and tampered lockfile entries or signatures.
 
 ## Scope
 
@@ -166,7 +170,8 @@ rejection, and `SKIP` without a token or network.
 - Ed25519 signatures use a local keypair. The publisher public key must be provisioned out of band;
   the tool does not distribute, rotate or revoke keys and does not verify publisher identity.
 - Packages are hashed and copied as bytes. No package code is executed.
-- Exact `x.y.z` versions only; no semver ranges, prerelease tags or transitive dependency graph
-  resolution.
+- Local `add`, `lock` and `verify` accept exact SemVer 2.0 pins or comparator ranges; ranges pin the
+  highest stable version in the lock. `publish`/`install` (local and GitHub) still use exact
+  versions. No transitive dependency graph resolution.
 - Manifest and lock writes are per-file atomic replacements, not one transaction. `verify` detects
   drift.
