@@ -80,6 +80,7 @@ const USAGE = `usage: opurom-pkg <command>
   add <name>@<spec>       resolve from registry/ and refresh opurom.lock
   remove <name>           remove a dependency and refresh opurom.lock
   list                    show packages in opurom.lock
+  outdated                compare opurom.lock against registry/ versions
   verify [--signed]       recompute SHA-256 of every locked file
   lock [--check]          regenerate or check deterministic opurom.lock
   sign                    write detached Ed25519 signatures
@@ -668,12 +669,7 @@ function commandLockCheck() {
   process.stdout.write(`opurom.lock is up to date (${packages.length} packages)\n`);
 }
 
-function commandList() {
-  const packages = readLockFile();
-  const rows = [['NAME', 'VERSION', 'FILES', 'PATH']];
-  for (const pkg of packages) {
-    rows.push([pkg.name, pkg.version, String(pkg.files.length), pkg.path]);
-  }
+function printRows(rows) {
   const widths = rows[0].map((_, column) =>
     Math.max(...rows.map((row) => row[column].length)),
   );
@@ -682,6 +678,37 @@ function commandList() {
       `${row.map((cell, column) => cell.padEnd(widths[column])).join('  ').trimEnd()}\n`,
     );
   }
+}
+
+function commandList() {
+  const packages = readLockFile();
+  const rows = [['NAME', 'VERSION', 'FILES', 'PATH']];
+  for (const pkg of packages) {
+    rows.push([pkg.name, pkg.version, String(pkg.files.length), pkg.path]);
+  }
+  printRows(rows);
+}
+
+// Compares every locked version with what the manifest spec resolves to today
+// and with the highest stable registry version. Read-only, so the byte-stable
+// lockfile contract is untouched; rows keep the lock's name order.
+function commandOutdated() {
+  const manifest = readManifestFile();
+  const specs = new Map(manifest.dependencies);
+  const rows = [['NAME', 'LOCKED', 'WANTED', 'LATEST']];
+  for (const pkg of readLockFile()) {
+    const spec = specs.get(pkg.name);
+    const wanted = spec === undefined ? '-' : resolveSpec(pkg.name, spec);
+    const latest =
+      highestSatisfying(parseRange('>=0.0.0'), registryVersions(pkg.name)) ?? '-';
+    if (pkg.version === wanted && pkg.version === latest) continue;
+    rows.push([pkg.name, pkg.version, wanted, latest]);
+  }
+  if (rows.length === 1) {
+    process.stdout.write('all locked packages are up to date\n');
+    return;
+  }
+  printRows(rows);
 }
 
 function manifestDriftErrors(dependencies, packages) {
@@ -1127,6 +1154,9 @@ async function main(argv) {
   } else if (command === 'list') {
     noArguments(command, rest);
     commandList();
+  } else if (command === 'outdated') {
+    noArguments(command, rest);
+    commandOutdated();
   } else if (command === 'verify') {
     if (rest.length === 0) {
       commandVerify();
