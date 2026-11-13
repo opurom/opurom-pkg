@@ -48,6 +48,7 @@ import {
   listenLoopback,
 } from '../lib/registry.mjs';
 import { HttpError, assertIntegrity, expectOk, request } from '../lib/http-client.mjs';
+import { highestSatisfying, parseRange, parseVersion } from '../lib/semver.mjs';
 
 // Mutations must never fall back to the tool's own repo: an uninitialized
 // working directory would otherwise silently rewrite the packaged manifest.
@@ -69,8 +70,6 @@ const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
 const READ_FLAGS = constants.O_RDONLY | NOFOLLOW;
 const WRITE_FLAGS = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NOFOLLOW;
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
-// shortcut: exact x.y.z versions only, upgrade when ranges or prerelease tags are needed.
-const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 // Local mock registry only: loopback HTTP, no TLS, no remote hosts.
 const DEFAULT_REGISTRY_URL = 'http://127.0.0.1:4873';
@@ -78,7 +77,7 @@ const DEFAULT_REGISTRY_URL = 'http://127.0.0.1:4873';
 const USAGE = `usage: opurom-pkg <command>
 
   init <name>             write opurom.json and an empty opurom.lock
-  add <name>@<version>    resolve from registry/ and refresh opurom.lock
+  add <name>@<spec>       resolve from registry/ and refresh opurom.lock
   remove <name>           remove a dependency and refresh opurom.lock
   list                    show packages in opurom.lock
   verify [--signed]       recompute SHA-256 of every locked file
@@ -92,7 +91,9 @@ const USAGE = `usage: opurom-pkg <command>
   publish --github <owner/repo> <name>@<version>
   install --github <owner/repo> <name>@<version>
 
-Run from the project root. Only exact x.y.z versions are supported.
+Run from the project root. publish/install use exact x.y.z versions; add also
+accepts SemVer 2.0 comparator ranges such as ">=1.0.0 <2.0.0", which pin the
+highest stable version in opurom.lock.
 Local publish/install use OPUROM_REGISTRY_URL (loopback HTTP only).
 --github uses https://api.github.com, or OPUROM_GITHUB_API_URL for a loopback mock.
 Publishing reads OPR_GITHUB_TOKEN from the environment only.`;
@@ -320,8 +321,18 @@ function validateName(name, label) {
 }
 
 function validateVersion(version, label) {
-  if (typeof version !== 'string' || !VERSION_RE.test(version)) {
-    throw new CliError(`invalid version for ${label}: ${String(version)}; use x.y.z`);
+  if (!parseVersion(version)) {
+    throw new CliError(
+      `invalid version for ${label}: ${String(version)}; use SemVer 2.0 x.y.z`,
+    );
+  }
+}
+
+function validateDependencySpec(spec, label) {
+  if (!parseRange(spec)) {
+    throw new CliError(
+      `invalid version for ${label}: ${String(spec)}; use SemVer 2.0 x.y.z or a comparator range`,
+    );
   }
 }
 
@@ -340,7 +351,7 @@ function validateManifest(data) {
   }
   const dependencies = Object.entries(data.dependencies).map(([name, version]) => {
     validateName(name, 'dependency name');
-    validateVersion(version, `dependency ${name}`);
+    validateDependencySpec(version, `dependency ${name}`);
     return [name, version];
   });
   dependencies.sort((left, right) => compareStrings(left[0], right[0]));
@@ -497,8 +508,40 @@ function collectPackage(name, version) {
   };
 }
 
+// Only version directories are candidates; a malformed one is a hard error so
+// a leading-zero version can never win by accident.
+function registryVersions(name) {
+  const relative = `registry/${name}`;
+  const directory = resolveContained(relative, `registry for ${name}`, 'directory');
+  const versions = [];
+  for (const entry of readdirSync(directory.absolute, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) {
+      throw new CliError(`unsafe registry path: ${relative}/${entry.name} (symlink rejected)`);
+    }
+    if (!entry.isDirectory()) continue;
+    if (!parseVersion(entry.name)) {
+      throw new CliError(`invalid version for ${name}: ${entry.name}; use SemVer 2.0 x.y.z`);
+    }
+    versions.push(entry.name);
+  }
+  return versions;
+}
+
+function resolveSpec(name, spec) {
+  const range = parseRange(spec);
+  if (!range) {
+    throw new CliError(
+      `invalid version for ${name}: ${String(spec)}; use SemVer 2.0 x.y.z or a comparator range`,
+    );
+  }
+  if (range.exact) return spec;
+  const winner = highestSatisfying(range, registryVersions(name));
+  if (winner === null) throw new CliError(`no version of ${name} satisfies ${spec}`);
+  return winner;
+}
+
 function buildPackages(dependencies) {
-  return dependencies.map(([name, version]) => collectPackage(name, version));
+  return dependencies.map(([name, spec]) => collectPackage(name, resolveSpec(name, spec)));
 }
 
 // shortcut: two atomic replacements are not one transaction; verify detects drift, upgrade for concurrent writers.
@@ -511,7 +554,7 @@ function writeProjectState(manifestData, dependencies, packages) {
   writeJsonFile('opurom.lock', { version: 1, packages });
 }
 
-function parseSpec(spec, command = 'add') {
+function parseSpec(spec, command = 'add', options = {}) {
   const at = spec.lastIndexOf('@');
   if (at <= 0 || at === spec.length - 1) {
     throw new CliError(`${command} needs <name>@<version>, for example opurom-ui@0.1.0`);
@@ -519,7 +562,11 @@ function parseSpec(spec, command = 'add') {
   const name = spec.slice(0, at);
   const version = spec.slice(at + 1);
   validateName(name, 'package name');
-  validateVersion(version, `package ${name}`);
+  if (options.allowRange) {
+    validateDependencySpec(version, `package ${name}`);
+  } else {
+    validateVersion(version, `package ${name}`);
+  }
   return { name, version };
 }
 
@@ -554,9 +601,9 @@ function applyDependency(name, version) {
 }
 
 function commandAdd(spec) {
-  const { name, version } = parseSpec(spec, 'add');
+  const { name, version } = parseSpec(spec, 'add', { allowRange: true });
   const added = applyDependency(name, version);
-  process.stdout.write(`added ${name}@${version} (${added.files.length} files)\n`);
+  process.stdout.write(`added ${name}@${added.version} (${added.files.length} files)\n`);
 }
 
 function commandRemove(name) {
@@ -614,11 +661,20 @@ function manifestDriftErrors(dependencies, packages) {
   const expected = new Map(dependencies);
   const locked = new Map(packages.map((pkg) => [pkg.name, pkg.version]));
   const errors = [];
-  for (const [name, version] of expected) {
+  for (const [name, spec] of expected) {
     if (!locked.has(name)) {
-      errors.push(`missing locked package: ${name}@${version}`);
-    } else if (locked.get(name) !== version) {
-      errors.push(`version drift: ${name} expected ${version}, lock has ${locked.get(name)}`);
+      errors.push(`missing locked package: ${name}@${spec}`);
+      continue;
+    }
+    let winner;
+    try {
+      winner = resolveSpec(name, spec);
+    } catch (error) {
+      errors.push(errorText(error));
+      continue;
+    }
+    if (locked.get(name) !== winner) {
+      errors.push(`version drift: ${name} expected ${winner}, lock has ${locked.get(name)}`);
     }
   }
   for (const [name, version] of locked) {
