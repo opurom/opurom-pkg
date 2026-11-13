@@ -80,6 +80,7 @@ const USAGE = `usage: opurom-pkg <command>
   add <name>@<spec>       resolve from registry/ and refresh opurom.lock
   remove <name>           remove a dependency and refresh opurom.lock
   list                    show packages in opurom.lock
+  show <name>             show one locked package's metadata
   outdated                compare opurom.lock against registry/ versions
   verify [--signed]       recompute SHA-256 of every locked file
   lock [--check]          regenerate or check deterministic opurom.lock
@@ -689,6 +690,21 @@ function commandList() {
   printRows(rows);
 }
 
+// One locked package, resolved purely from opurom.lock (name, version, package
+// digest, sorted file checksums) so an audit needs no registry access.
+function commandShow(name) {
+  validateName(name, 'package name');
+  const pkg = readLockFile().find((entry) => entry.name === name);
+  if (!pkg) throw new CliError(`unknown locked package: ${name}`);
+  const rows = [['NAME', 'VERSION', 'FILES', 'PATH', 'SHA256']];
+  rows.push([pkg.name, pkg.version, String(pkg.files.length), pkg.path, pkg.sha256]);
+  printRows(rows);
+  process.stdout.write('\nFILES\n');
+  for (const file of pkg.files) {
+    process.stdout.write(`${file.sha256}  ${file.path}\n`);
+  }
+}
+
 // Compares every locked version with what the manifest spec resolves to today
 // and with the highest stable registry version. Read-only, so the byte-stable
 // lockfile contract is untouched; rows keep the lock's name order.
@@ -1154,6 +1170,8 @@ async function main(argv) {
   } else if (command === 'list') {
     noArguments(command, rest);
     commandList();
+  } else if (command === 'show') {
+    commandShow(oneArgument(command, rest));
   } else if (command === 'outdated') {
     noArguments(command, rest);
     commandOutdated();
