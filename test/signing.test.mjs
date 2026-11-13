@@ -85,7 +85,7 @@ test('verify --signed without a keypair reports a missing public key', (t) => {
   assert.match(result.output, /missing public key/);
 });
 
-test('verify without --signed keeps its R5 behaviour', (t) => {
+test('verify without --signed checks hashes only', (t) => {
   const root = seededProject(t);
   const result = ok(root, 'verify');
   assert.match(result.stdout, /PASS {2}<manifest>/);
