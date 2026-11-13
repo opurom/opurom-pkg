@@ -12,6 +12,7 @@ node bin/opurom-pkg.mjs add opurom-ui@0.1.0
 node bin/opurom-pkg.mjs list
 node bin/opurom-pkg.mjs verify
 node bin/opurom-pkg.mjs lock
+node bin/opurom-pkg.mjs lock --check
 node bin/opurom-pkg.mjs remove opurom-ui
 node bin/opurom-pkg.mjs sign
 node bin/opurom-pkg.mjs verify --signed
@@ -24,7 +25,7 @@ node bin/opurom-pkg.mjs publish --github opurom/opurom-pkg opurom-ui@0.1.0
 node bin/opurom-pkg.mjs install --github opurom/opurom-pkg opurom-ui@0.1.0
 ```
 
-`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one exact `name@x.y.z` package from `registry/<name>/<version>/` and refreshes both the manifest and lock. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry.
+`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one exact `name@x.y.z` package from `registry/<name>/<version>/` and refreshes both the manifest and lock. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged.
 
 Commands run against the current directory. When the current directory has no `opurom.json` and no
 `registry/`, the CLI falls back to the package directory that owns the script, so
@@ -80,7 +81,7 @@ reuses the same keypair and rewrites the same signatures.
 
 `verify --signed` checks every locked file and the lockfile against `keys/opurom.pub`. It rejects a
 tampered file, a missing signature, a signature made by a different key, and lock drift. `verify`
-without `--signed` keeps its capability behaviour and never looks at signatures.
+without `--signed` checks hashes only and never looks at signatures.
 
 The private key never leaves the project directory and is never printed. Nothing in this repository
 publishes a public key, so `verify --signed` proves only that the files match the local keypair, not
@@ -146,28 +147,26 @@ node --check bin/*.mjs lib/*.mjs test/*.mjs
 
 The suite uses temporary project roots and copies the local registry. It covers manifest validation,
 add/list/remove round trip, byte-stable lock regeneration, clean verification, tampered files, missing
-files, traversal paths, invalid versions, unknown packages and lock drift. The capability tests add the
-sign/verify round trip, tampered content, a wrong key, a missing signature, registry `GET` and `404`,
-a publish/install round trip over real TCP against an ephemeral-port server, integrity mismatches,
-traversal rejection, bounded bodies and port release after shutdown. The capability tests add GitHub Release
-asset naming, mock publish/search/install over real TCP, signature and integrity rejection, wrong-key
-and missing-signature rejection, bounded-size and archive traversal rejection, and `SKIP` without a
-token or network.
+files, traversal paths, invalid versions, unknown packages and lock drift. The lock determinism tests
+cover a current lock, a reformatted lock, changed registry bytes, manifest drift, an empty lock, a
+missing lock and an invalid option, and confirm that `lock --check` never rewrites the lockfile. The
+signing tests add the sign/verify round trip, tampered content, a wrong key, a missing signature,
+registry `GET` and `404`, a publish/install round trip over real TCP against an ephemeral-port server,
+integrity mismatches, traversal rejection, bounded bodies and port release after shutdown. The GitHub
+tests add GitHub Release asset naming, mock publish/search/install over real TCP, signature and
+integrity rejection, wrong-key and missing-signature rejection, bounded-size and archive traversal
+rejection, and `SKIP` without a token or network.
 
-## Honest status and capability+
+## Scope
 
-- One GitHub org's Releases are used as a signed public registry. NO general marketplace service, NO
-  ratings and NO mirror network.
+- One GitHub org's Releases are used as a signed public registry. The registry surface is the
+  GitHub Releases API of a single org.
 - GitHub publish uses a token from `OPR_GITHUB_TOKEN` and HTTPS; public search/install can be
   unauthenticated. The loopback mock is plain HTTP and in-memory only.
-- Ed25519 signatures use a local keypair. The publisher public key must be provisioned out of band.
-  NO key distribution, rotation or revocation service, NO trust store, NO certificate chain and NO
-  publisher identity verification.
-- NO code execution; packages are hashed and copied as bytes.
+- Ed25519 signatures use a local keypair. The publisher public key must be provisioned out of band;
+  the tool does not distribute, rotate or revoke keys and does not verify publisher identity.
+- Packages are hashed and copied as bytes. No package code is executed.
 - Exact `x.y.z` versions only; no semver ranges, prerelease tags or transitive dependency graph
   resolution.
 - Manifest and lock writes are per-file atomic replacements, not one transaction. `verify` detects
   drift.
-- capability+: a key distribution/rotation/revocation service, trust store, ratings, mirror network,
-  semver ranges, transitive dependency resolution, transactional writes and a multi-org marketplace
-  service.

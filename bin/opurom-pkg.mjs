@@ -82,7 +82,7 @@ const USAGE = `usage: opurom-pkg <command>
   remove <name>           remove a dependency and refresh opurom.lock
   list                    show packages in opurom.lock
   verify [--signed]       recompute SHA-256 of every locked file
-  lock                    regenerate deterministic opurom.lock
+  lock [--check]          regenerate or check deterministic opurom.lock
   sign                    write detached Ed25519 signatures
   registry-server [--port N]       serve registry/ on loopback HTTP
   github-registry-server [--port N] serve a GitHub API mock on loopback
@@ -578,6 +578,22 @@ function commandLock() {
   process.stdout.write(`regenerated opurom.lock (${packages.length} packages)\n`);
 }
 
+// Byte comparison catches drift that hash checks miss, such as a reformatted lockfile.
+function commandLockCheck() {
+  const lockPath = path.join(ROOT, 'opurom.lock');
+  if (!existsSync(lockPath)) {
+    throw new CliError('missing opurom.lock; run lock first');
+  }
+  const { dependencies } = readManifestFile();
+  const packages = buildPackages(dependencies);
+  const expected = stableJson({ version: 1, packages });
+  const actual = readNoFollow(lockPath, 'opurom.lock', 'utf8');
+  if (actual !== expected) {
+    throw new CliError('opurom.lock is stale; run lock to regenerate it');
+  }
+  process.stdout.write(`opurom.lock is up to date (${packages.length} packages)\n`);
+}
+
 function commandList() {
   const packages = readLockFile();
   const rows = [['NAME', 'VERSION', 'FILES', 'PATH']];
@@ -1026,8 +1042,13 @@ async function main(argv) {
       throw new CliError(`verify takes no arguments or --signed`, 2);
     }
   } else if (command === 'lock') {
-    noArguments(command, rest);
-    commandLock();
+    if (rest.length === 0) {
+      commandLock();
+    } else if (rest.length === 1 && rest[0] === '--check') {
+      commandLockCheck();
+    } else {
+      throw new CliError('lock takes no arguments or --check', 2);
+    }
   } else if (command === 'sign') {
     noArguments(command, rest);
     commandSign();
