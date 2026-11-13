@@ -93,7 +93,9 @@ const USAGE = `usage: opurom-pkg <command>
 
 Run from the project root. publish/install use exact x.y.z versions; add also
 accepts SemVer 2.0 comparator ranges such as ">=1.0.0 <2.0.0", which pin the
-highest stable version in opurom.lock.
+highest stable version in opurom.lock. Every lock write records the SHA-256 of
+opurom.json; verify --signed compares the manifest with that signed digest, and
+lock refreshes it after a legitimate edit.
 Local publish/install use OPUROM_REGISTRY_URL (loopback HTTP only).
 --github uses https://api.github.com, or OPUROM_GITHUB_API_URL for a loopback mock.
 Publishing reads OPR_GITHUB_TOKEN from the environment only.`;
@@ -259,6 +261,11 @@ function hashFile(absolute, label) {
   return sha256(readNoFollow(absolute, label));
 }
 
+// Hashes the manifest bytes on disk, so any edit (not just a dependency change) is visible.
+function manifestSha256() {
+  return hashFile(path.join(ROOT, 'opurom.json'), 'opurom.json');
+}
+
 function readJsonAt(relative, label) {
   const target = resolveContained(relative, label, 'file');
   const text = readNoFollow(target.absolute, label, 'utf8');
@@ -414,6 +421,13 @@ function validateLock(data) {
   if (!plainObject(data)) throw new CliError('lockfile must be a JSON object');
   if (data.version !== 1) throw new CliError('unsupported opurom.lock version');
   if (!Array.isArray(data.packages)) throw new CliError('packages must be an array');
+  // Older locks may omit it; verify --signed refuses those instead of trusting them.
+  if (
+    data.manifestSha256 !== undefined &&
+    (typeof data.manifestSha256 !== 'string' || !SHA256_RE.test(data.manifestSha256))
+  ) {
+    throw new CliError('invalid manifestSha256 in opurom.lock');
+  }
   const packages = data.packages.map(validateLockedPackage);
   const sorted = [...packages].sort(comparePackages);
   if (!packages.every((pkg, index) => pkg === sorted[index])) {
@@ -422,14 +436,18 @@ function validateLock(data) {
   if (new Set(packages.map((pkg) => pkg.name)).size !== packages.length) {
     throw new CliError('duplicate locked package name');
   }
-  return packages;
+  return { manifestSha256: data.manifestSha256 ?? null, packages };
 }
 
-function readLockFile() {
+function readLockData() {
   if (!existsSync(path.join(ROOT, 'opurom.lock'))) {
     throw new CliError('missing opurom.lock; run lock first');
   }
   return validateLock(readJsonAt('opurom.lock', 'lockfile'));
+}
+
+function readLockFile() {
+  return readLockData().packages;
 }
 
 function walkFiles(relativeDirectory, absoluteDirectory) {
@@ -544,6 +562,15 @@ function buildPackages(dependencies) {
   return dependencies.map(([name, spec]) => collectPackage(name, resolveSpec(name, spec)));
 }
 
+// The signed lockfile attests to the manifest bytes that produced it.
+function lockData(packages) {
+  return { version: 1, manifestSha256: manifestSha256(), packages };
+}
+
+function writeLock(packages) {
+  writeJsonFile('opurom.lock', lockData(packages));
+}
+
 // shortcut: two atomic replacements are not one transaction; verify detects drift, upgrade for concurrent writers.
 function writeProjectState(manifestData, dependencies, packages) {
   const nextManifest = {
@@ -551,7 +578,7 @@ function writeProjectState(manifestData, dependencies, packages) {
     dependencies: Object.fromEntries(dependencies),
   };
   writeJsonFile('opurom.json', nextManifest);
-  writeJsonFile('opurom.lock', { version: 1, packages });
+  writeLock(packages);
 }
 
 function parseSpec(spec, command = 'add', options = {}) {
@@ -583,7 +610,7 @@ function commandInit(name) {
     moduleRoots: ['registry'],
     dependencies: {},
   });
-  writeJsonFile('opurom.lock', { version: 1, packages: [] });
+  writeLock([]);
   process.stdout.write(`initialized ${name}\n`);
 }
 
@@ -621,7 +648,7 @@ function commandRemove(name) {
 function commandLock() {
   const { dependencies } = readManifestFile();
   const packages = buildPackages(dependencies);
-  writeJsonFile('opurom.lock', { version: 1, packages });
+  writeLock(packages);
   process.stdout.write(`regenerated opurom.lock (${packages.length} packages)\n`);
 }
 
@@ -633,7 +660,7 @@ function commandLockCheck() {
   }
   const { dependencies } = readManifestFile();
   const packages = buildPackages(dependencies);
-  const expected = stableJson({ version: 1, packages });
+  const expected = stableJson(lockData(packages));
   const actual = readNoFollow(lockPath, 'opurom.lock', 'utf8');
   if (actual !== expected) {
     throw new CliError('opurom.lock is stale; run lock to regenerate it');
@@ -811,7 +838,22 @@ function verifySignatureFile(publicKey, relativePath) {
   return [];
 }
 
-function verifySignedPackages(packages) {
+// The digest lives in the signed lockfile, so it is only trusted after that signature verifies.
+function manifestIntegrityErrors(expectedSha256) {
+  if (expectedSha256 === null) {
+    return ['missing manifestSha256 in opurom.lock; run lock to record it'];
+  }
+  try {
+    if (manifestSha256() !== expectedSha256) {
+      return ['manifest digest mismatch: opurom.json; run lock to refresh it'];
+    }
+  } catch (error) {
+    return [errorText(error)];
+  }
+  return [];
+}
+
+function verifySignedPackages(lock) {
   let publicKey;
   try {
     publicKey = readPublicKey(ROOT);
@@ -821,7 +863,7 @@ function verifySignedPackages(packages) {
     };
   }
   const checks = [];
-  for (const pkg of packages) {
+  for (const pkg of lock.packages) {
     const errors = [];
     for (const file of pkg.files) {
       errors.push(...verifySignatureFile(publicKey, file.path));
@@ -833,16 +875,19 @@ function verifySignedPackages(packages) {
     });
   }
   const lockErrors = verifySignatureFile(publicKey, 'opurom.lock');
+  if (lockErrors.length === 0) {
+    lockErrors.push(...manifestIntegrityErrors(lock.manifestSha256));
+  }
   checks.push({
     label: 'opurom.lock',
-    detail: 'lockfile signed',
+    detail: 'lockfile signed; manifest digest checked',
     errors: lockErrors,
   });
   return { checks };
 }
 
-function commandVerifySigned(packages) {
-  const { checks } = verifySignedPackages(packages);
+function commandVerifySigned(lock) {
+  const { checks } = verifySignedPackages(lock);
   report(checks);
 }
 
@@ -1086,14 +1131,14 @@ async function main(argv) {
     if (rest.length === 0) {
       commandVerify();
     } else if (rest.length === 1 && rest[0] === '--signed') {
-      let packages;
+      let lock;
       try {
-        packages = readLockFile();
+        lock = readLockData();
       } catch (error) {
         report([{ label: '<lock>', detail: '', errors: [errorText(error)] }]);
         return;
       }
-      commandVerifySigned(packages);
+      commandVerifySigned(lock);
     } else {
       throw new CliError(`verify takes no arguments or --signed`, 2);
     }

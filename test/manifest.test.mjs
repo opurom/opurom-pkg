@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -15,7 +16,14 @@ test('init writes a valid manifest and empty lock', (t) => {
     moduleRoots: ['registry'],
     dependencies: {},
   });
-  assert.deepEqual(readJson(root, 'opurom.lock'), { version: 1, packages: [] });
+  const lock = readJson(root, 'opurom.lock');
+  assert.equal(lock.version, 1);
+  assert.deepEqual(lock.packages, []);
+  assert.match(lock.manifestSha256, /^[0-9a-f]{64}$/);
+  assert.equal(
+    lock.manifestSha256,
+    createHash('sha256').update(readFileSync(path.join(root, 'opurom.json'))).digest('hex'),
+  );
   assert.match(ok(root, 'verify').stdout, /1\/1 checks passed/);
 });
 

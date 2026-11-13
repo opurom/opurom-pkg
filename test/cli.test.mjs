@@ -49,9 +49,13 @@ test('lock regeneration is byte stable and matches committed lock', (t) => {
   ok(root, 'lock');
   const second = readFileSync(`${root}/opurom.lock`);
   assert.equal(first.toString('utf8'), second.toString('utf8'));
-  assert.equal(first.toString('utf8'), readFileSync(LOCKFILE, 'utf8'));
-
   const lock = JSON.parse(first.toString('utf8'));
+  assert.match(lock.manifestSha256, /^[0-9a-f]{64}$/);
+  const committed = JSON.parse(readFileSync(LOCKFILE, 'utf8'));
+  assert.match(committed.manifestSha256, /^[0-9a-f]{64}$/);
+  delete lock.manifestSha256;
+  delete committed.manifestSha256;
+  assert.equal(`${JSON.stringify(lock, null, 2)}\n`, `${JSON.stringify(committed, null, 2)}\n`);
   assert.equal(lock.version, 1);
   assert.deepEqual(lock.packages.map((pkg) => pkg.name), ['opurom-data', 'opurom-ui']);
   for (const pkg of lock.packages) {
