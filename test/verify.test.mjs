@@ -55,7 +55,7 @@ test('verify fails on traversal paths', (t) => {
 test('verify fails on invalid versions', (t) => {
   const root = seededProject(t);
   const lock = readJson(root, 'opurom.lock');
-  lock.packages[0].version = '0.1.0';
+  lock.packages[0].version = '1.2';
   writeJson(root, 'opurom.lock', lock);
   let result = run(root, 'verify');
   assert.notEqual(result.status, 0);
@@ -63,7 +63,7 @@ test('verify fails on invalid versions', (t) => {
 
   const manifestRoot = seededProject(t);
   const manifest = readJson(manifestRoot, 'opurom.json');
-  manifest.dependencies['opurom-ui'] = '0.1.0';
+  manifest.dependencies['opurom-ui'] = '1.2';
   writeJson(manifestRoot, 'opurom.json', manifest);
   result = run(manifestRoot, 'verify');
   assert.notEqual(result.status, 0);

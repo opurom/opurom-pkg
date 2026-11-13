@@ -49,7 +49,7 @@ test('manifest validation rejects traversal and malformed fields', (t) => {
 
   manifest = readJson(root, 'opurom.json');
   manifest.moduleRoots = ['registry'];
-  manifest.version = '0.1.0';
+  manifest.version = '1.2';
   writeJson(root, 'opurom.json', manifest);
   result = run(root, 'lock');
   assert.notEqual(result.status, 0);

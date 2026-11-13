@@ -87,3 +87,23 @@ test('invalid version and unknown package are rejected', (t) => {
   assert.notEqual(result.status, 0);
   assert.match(result.output, /invalid package name/);
 });
+
+test('show prints one locked package metadata from opurom.lock', (t) => {
+  const root = makeProject(t);
+  ok(root, 'init', 'demo-app');
+  ok(root, 'add', 'opurom-ui@0.1.0');
+
+  const shown = ok(root, 'show', 'opurom-ui');
+  assert.match(shown.stdout, /opurom-ui\s+0\.1\.0\s+3\s+registry\/opurom-ui\/0\.1\.0\s+[0-9a-f]{64}/);
+  for (const file of ['button.opu', 'card.opu', 'opurom-pkg.json']) {
+    assert.match(shown.stdout, new RegExp(`[0-9a-f]{64}  registry/opurom-ui/0\\.1\\.0/${file}`));
+  }
+
+  const missing = run(root, 'show', 'opurom-data');
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.output, /unknown locked package: opurom-data/);
+
+  const empty = run(root, 'show');
+  assert.notEqual(empty.status, 0);
+  assert.match(empty.output, /show needs exactly one argument/);
+});

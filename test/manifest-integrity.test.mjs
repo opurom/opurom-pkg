@@ -21,7 +21,7 @@ function digest(root, relative) {
 
 function editVersion(root) {
   const manifest = readJson(root, 'opurom.json');
-  manifest.version = '0.1.0';
+  manifest.version = '9.9.9';
   writeJson(root, 'opurom.json', manifest);
 }
 
