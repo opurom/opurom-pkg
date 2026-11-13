@@ -12,6 +12,7 @@ node bin/opurom-pkg.mjs add opurom-ui@0.1.0
 node bin/opurom-pkg.mjs list
 node bin/opurom-pkg.mjs verify
 node bin/opurom-pkg.mjs lock
+node bin/opurom-pkg.mjs lock --check
 node bin/opurom-pkg.mjs remove opurom-ui
 node bin/opurom-pkg.mjs sign
 node bin/opurom-pkg.mjs verify --signed
@@ -24,7 +25,7 @@ node bin/opurom-pkg.mjs publish --github opurom/opurom-pkg opurom-ui@0.1.0
 node bin/opurom-pkg.mjs install --github opurom/opurom-pkg opurom-ui@0.1.0
 ```
 
-`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one exact `name@x.y.z` package from `registry/<name>/<version>/` and refreshes both the manifest and lock. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry.
+`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one exact `name@x.y.z` package from `registry/<name>/<version>/` and refreshes both the manifest and lock. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged.
 
 Commands run against the current directory. When the current directory has no `opurom.json` and no
 `registry/`, the CLI falls back to the package directory that owns the script, so
@@ -146,13 +147,15 @@ node --check bin/*.mjs lib/*.mjs test/*.mjs
 
 The suite uses temporary project roots and copies the local registry. It covers manifest validation,
 add/list/remove round trip, byte-stable lock regeneration, clean verification, tampered files, missing
-files, traversal paths, invalid versions, unknown packages and lock drift. The signing tests add the
-sign/verify round trip, tampered content, a wrong key, a missing signature, registry `GET` and `404`,
-a publish/install round trip over real TCP against an ephemeral-port server, integrity mismatches,
-traversal rejection, bounded bodies and port release after shutdown. The GitHub tests add GitHub Release
-asset naming, mock publish/search/install over real TCP, signature and integrity rejection, wrong-key
-and missing-signature rejection, bounded-size and archive traversal rejection, and `SKIP` without a
-token or network.
+files, traversal paths, invalid versions, unknown packages and lock drift. The lock determinism tests
+cover a current lock, a reformatted lock, changed registry bytes, manifest drift, an empty lock, a
+missing lock and an invalid option, and confirm that `lock --check` never rewrites the lockfile. The
+signing tests add the sign/verify round trip, tampered content, a wrong key, a missing signature,
+registry `GET` and `404`, a publish/install round trip over real TCP against an ephemeral-port server,
+integrity mismatches, traversal rejection, bounded bodies and port release after shutdown. The GitHub
+tests add GitHub Release asset naming, mock publish/search/install over real TCP, signature and
+integrity rejection, wrong-key and missing-signature rejection, bounded-size and archive traversal
+rejection, and `SKIP` without a token or network.
 
 ## Scope
 
