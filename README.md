@@ -103,7 +103,8 @@ that a trusted publisher produced them.
 
 `registry-server` serves `registry/` over loopback HTTP. `publish <name>@<version>` uploads a local
 package with its SHA-256 digest; `install <name>@<version>` downloads an exact version, verifies the
-digest, writes it under `registry/` and refreshes the manifest and lock.
+digest, writes it under `registry/`, resolves and downloads every transitive dependency the local
+registry cannot satisfy, and refreshes the manifest and lock.
 
 ```sh
 node bin/opurom-pkg.mjs registry-server --port 0
@@ -113,7 +114,8 @@ Opurom_REGISTRY_URL=http://127.0.0.1:4873 node bin/opurom-pkg.mjs install opurom
 
 `Opurom_REGISTRY_URL` defaults to `http://127.0.0.1:4873` and only loopback hosts are accepted. The
 server rejects absolute paths, `..` traversal and percent-encoded traversal, bounds request bodies at
-4 MiB, and answers `404` for unknown packages. `install` verifies the SHA-256 of every downloaded file
+4 MiB, and answers `404` for unknown packages. `GET /packages/<name>/` lists the stored versions of
+one package so an install can resolve a range remotely. `install` verifies the SHA-256 of every downloaded file
 and refuses to write a file whose digest does not match the registry listing.
 
 ## GitHub-backed registry
@@ -130,7 +132,9 @@ is never written to a file, log, stdout or tracked artifact.
 SHA-256 Release body are all present. `install --github <owner/repo> <name>@<version>` downloads the
 assets over HTTPS, verifies the Ed25519 signature against the locally provisioned `keys/opurom.pub`,
 checks the archive SHA-256 against the Release body and every file SHA-256 against the signed ZIP
-manifest, then writes files under `registry/`. It rejects tampering, wrong keys, missing signatures,
+manifest, then writes files under `registry/`. Transitive packages are resolved by range through
+`search --github` and take the same download, signature and digest checks. It rejects tampering,
+wrong keys, missing signatures,
 traversal, unexpected download hosts and bounded-size violations. Public reads do not require a
 token; publishing requires one.
 
@@ -176,7 +180,10 @@ registries with no network: exact pins, stable-range precedence, prerelease excl
 selection and build-metadata ties, leading-zero rejection, and tampered lockfile entries or signatures.
 The dependency-tree tests cover transitive resolution into the lock, one pinned version satisfying
 shared requirements, a conflict report naming each requirer, backtracking past an earlier choice,
-cycles, malformed registry contracts and transitive lock gaps reported by `verify`. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
+cycles, malformed registry contracts and transitive lock gaps reported by `verify`. The install-closure
+tests cover the transitive fetch over loopback HTTP and its version-list endpoint, a satisfied local
+package that is not fetched again, an honest failure when no remote version satisfies a transitive
+contract, and the same transitive fetch on the GitHub path. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
 a range with prereleases excluded, byte-identical repeated output, independence from registry directory
 order, an up-to-date project and a missing registry package.
 
@@ -190,8 +197,8 @@ order, an up-to-date project and a missing registry package.
   the tool does not distribute, rotate or revoke keys and does not verify publisher identity.
 - Packages are hashed and copied as bytes. No package code is executed.
 - Local `add`, `lock` and `verify` accept exact SemVer 2.0 pins or comparator ranges; ranges pin the
-  highest version the whole tree allows in the lock. `publish`/`install` (local and GitHub) still use
-  exact versions. Transitive requirements resolve from each package's registry manifest; unsatisfiable
-  requirements fail with a conflict report.
+  highest version the whole tree allows in the lock. `publish` uses exact versions; `install` takes an
+  exact version and resolves its transitive closure by range. Transitive requirements resolve from
+  each package's registry manifest; unsatisfiable requirements fail with a conflict report.
 - Manifest and lock writes are per-file atomic replacements, not one transaction. `verify` detects
   drift.

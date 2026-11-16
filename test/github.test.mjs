@@ -6,6 +6,7 @@ import http from 'node:http';
 import path from 'node:path';
 import {
   ok,
+  readJson,
   runWithEnvAsync,
   seededProject,
   startGithubMock,
@@ -501,4 +502,60 @@ test('install rejects traversal inside a signed archive', async (t) => {
   assert.match(result.output, /unsafe archive path/);
   assert.ok(!existsSync(path.join(client, 'evil.opu')));
   assert.ok(!existsSync(path.join(client, 'registry', NAME, VERSION, 'extra.opu')));
+});
+
+function githubPackage(root, name, version, dependencies) {
+  const directory = path.join(root, 'registry', name, version);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(path.join(directory, 'extra.opu'), `state ${name} = 1\n`);
+  const manifest = { name, version, files: ['extra.opu', 'opurom-pkg.json'] };
+  if (dependencies !== undefined) manifest.dependencies = dependencies;
+  writeJson(root, path.join('registry', name, version, 'opurom-pkg.json'), manifest);
+}
+
+test('install --github closes the transitive dependency tree', async (t) => {
+  const mock = await startGithubMock(t);
+  const env = envFor(mock);
+  const publisher = seededProject(t);
+  githubPackage(publisher, 'gh-a', '1.0.0', { 'gh-b': '>=1.0.0' });
+  githubPackage(publisher, 'gh-b', '1.0.0');
+  githubPackage(publisher, 'gh-b', '1.1.0');
+  for (const spec of ['gh-a@1.0.0', 'gh-b@1.0.0', 'gh-b@1.1.0']) {
+    const published = await runWithEnvAsync(
+      publisher,
+      env,
+      'publish',
+      '--github',
+      REPOSITORY,
+      spec,
+    );
+    assert.equal(published.status, 0, published.output);
+  }
+
+  const client = seededProject(t);
+  copyPublicKey(publisher, client);
+  const installed = await runWithEnvAsync(
+    client,
+    env,
+    'install',
+    '--github',
+    REPOSITORY,
+    'gh-a@1.0.0',
+  );
+  assert.equal(installed.status, 0, installed.output);
+  assert.match(installed.stdout, /installed gh-a@1\.0\.0/);
+  assert.match(installed.stdout, /fetched transitive: gh-b@1\.1\.0/);
+  assert.ok(existsSync(path.join(client, 'registry', 'gh-b', '1.1.0', 'extra.opu')));
+  assert.ok(
+    !installed.output.includes(env.OPR_GITHUB_TOKEN),
+    'install output must not contain the token',
+  );
+
+  ok(client, 'lock');
+  assert.deepEqual(
+    readJson(client, 'opurom.lock').packages.map((pkg) => pkg.name),
+    ['gh-a', 'gh-b', 'opurom-data', 'opurom-ui'],
+  );
+  assert.match(ok(client, 'lock', '--check').stdout, /up to date \(4 packages\)/);
+  assert.match(ok(client, 'verify').stdout, /5\/5 checks passed/);
 });

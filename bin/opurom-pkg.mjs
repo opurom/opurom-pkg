@@ -104,8 +104,9 @@ accepts SemVer 2.0 comparator ranges such as ">=1.0.0 <2.0.0", which pin the
 highest stable version in opurom.lock. Registry packages may declare their own
 dependencies; the reachable tree resolves to one consistent version per
 package, and conflicting requirements are reported with their requirers.
-Every lock write records the SHA-256 of opurom.json; verify --signed compares
-the manifest with that signed digest, and lock refreshes it after a
+install also fetches every transitive dependency the local registry cannot
+satisfy. Every lock write records the SHA-256 of opurom.json; verify --signed
+compares the manifest with that signed digest, and lock refreshes it after a
 legitimate edit.
 Local publish/install use Opurom_REGISTRY_URL (loopback HTTP only).
 --github uses https://api.github.com, or Opurom_GITHUB_API_URL for a loopback mock.
@@ -1210,9 +1211,56 @@ function writeInstalledFile(relative, bytes, expectedSha256 = null) {
   }
 }
 
-async function commandInstall(contract) {
-  const { name, version } = parseSpec(contract, 'install');
-  const base = registryUrl();
+// The best local registry version satisfying a contract, or null when the
+// registry (or every version in it) cannot satisfy it.
+function localSatisfying(name, contract) {
+  if (!existsSync(path.join(ROOT, 'registry', name))) return null;
+  return highestSatisfying(parseRange(contract), registryVersions(name));
+}
+
+// One remote version satisfying a contract, or an honest failure. Remote
+// versions are validated like local registry directories.
+function pickRemote(name, contract, versions) {
+  for (const version of versions) validateVersion(version, name);
+  const winner = highestSatisfying(parseRange(contract), versions);
+  if (winner === null) throw new CliError(`no remote version of ${name} satisfies ${contract}`);
+  return winner;
+}
+
+async function remoteHttpVersions(base, name) {
+  const url = new URL(`packages/${name}/`, base);
+  const response = expectOk(await request(url), `install ${name} (version list)`);
+  const listing = JSON.parse(response.body.toString('utf8'));
+  if (!plainObject(listing) || !Array.isArray(listing.versions)) {
+    throw new CliError(`registry returned an invalid version list for ${name}`);
+  }
+  return listing.versions;
+}
+
+// Installs the reachable dependency closure: every requirement the local
+// registry cannot satisfy is resolved remotely and fetched, then its own
+// edges are followed. Returns fetched packages as name@version, in order.
+async function installClosure(startEdges, resolveRemote, fetchPackage) {
+  const ensured = new Set();
+  const queue = [...startEdges];
+  const fetched = [];
+  while (queue.length > 0) {
+    const [name, contract] = queue.shift();
+    const seen = `${name}@${contract}`;
+    if (ensured.has(seen)) continue;
+    ensured.add(seen);
+    let version = localSatisfying(name, contract);
+    if (version === null) {
+      version = await resolveRemote(name, contract);
+      await fetchPackage(name, version);
+      fetched.push(`${name}@${version}`);
+    }
+    queue.push(...registryDependencies(name, version));
+  }
+  return fetched;
+}
+
+async function fetchRegistryPackage(name, version, base) {
   const manifestUrl = new URL(`packages/${name}/${version}/`, base);
   const manifestResponse = expectOk(
     await request(manifestUrl),
@@ -1230,10 +1278,26 @@ async function commandInstall(contract) {
     assertIntegrity(response, entry.sha256, `install ${name}@${version} (${entry.path})`);
     writeInstalledFile(relative, response.body);
   }
+}
+
+async function commandInstall(contract) {
+  const { name, version } = parseSpec(contract, 'install');
+  const base = registryUrl();
+  await fetchRegistryPackage(name, version, base);
+  const fetched = await installClosure(
+    registryDependencies(name, version),
+    async (dependency, range) => {
+      return pickRemote(dependency, range, await remoteHttpVersions(base, dependency));
+    },
+    (dependency, wanted) => fetchRegistryPackage(dependency, wanted, base),
+  );
   const added = applyDependency(name, version);
   process.stdout.write(
     `installed ${name}@${version} (${added.files.length} files) from ${base}\n`,
   );
+  if (fetched.length > 0) {
+    process.stdout.write(`fetched transitive: ${fetched.join(' ')}\n`);
+  }
 }
 
 async function commandPublishGithub(repository, contract) {
@@ -1284,8 +1348,9 @@ async function commandSearchGithub(repository, positional) {
   }
 }
 
-async function commandInstallGithub(repository, contract) {
-  const { name, version } = parseSpec(contract, 'install');
+// Downloads and verifies one signed package archive, then writes its files.
+// Both the requested package and every fetched transitive package take this path.
+async function fetchGithubPackage(repository, name, version) {
   const payload = await githubRegistry().download({ repository, name, version });
   const names = assetNames(name, version);
   const publicKey = readPublicKey(ROOT);
@@ -1308,10 +1373,27 @@ async function commandInstallGithub(repository, contract) {
     const relative = path.posix.join(packageRelative, assertSafePath(file.path));
     writeInstalledFile(relative, file.bytes, file.sha256);
   }
+  return payload;
+}
+
+async function commandInstallGithub(repository, contract) {
+  const { name, version } = parseSpec(contract, 'install');
+  const payload = await fetchGithubPackage(repository, name, version);
+  const fetched = await installClosure(
+    registryDependencies(name, version),
+    async (dependency, range) => {
+      const rows = await githubRegistry().search({ repository, name: dependency });
+      return pickRemote(dependency, range, rows.map((row) => row.version));
+    },
+    (dependency, wanted) => fetchGithubPackage(repository, dependency, wanted),
+  );
   const added = applyDependency(name, version);
   process.stdout.write(
     `installed ${name}@${version} (${added.files.length} files) from ${payload.releaseUrl} (${payload.asset})\n`,
   );
+  if (fetched.length > 0) {
+    process.stdout.write(`fetched transitive: ${fetched.join(' ')}\n`);
+  }
 }
 
 async function main(argv) {
