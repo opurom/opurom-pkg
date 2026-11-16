@@ -38,10 +38,14 @@ import {
   GitHubRegistryError,
   MAX_BUNDLE_BYTES,
   MAX_CHANNEL_MANIFEST_BYTES,
+  RELEASE_PAGE_LIMIT,
   RegistryNetworkError,
   assetNames,
   createGithubMockServer,
   createGithubRegistry,
+  deriveMarketFacts,
+  manifestAssetName,
+  parseAssetName,
   parseRepository,
   parseTrainTag,
 } from '../lib/github-registry.mjs';
@@ -94,6 +98,7 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 // Local mock registry only: loopback HTTP, no TLS, no remote hosts.
 const DEFAULT_REGISTRY_URL = 'http://127.0.0.1:4873';
 const CHANNEL_MANIFEST = 'update-channel.json';
+const CAPABILITY_RE = /^[a-z0-9][A-Za-z0-9_-]*(\.[A-Za-z0-9][A-Za-z0-9_-]*)+$/;
 
 const USAGE = `usage: opurom-pkg <command>
 
@@ -117,7 +122,8 @@ const USAGE = `usage: opurom-pkg <command>
                                    never install
   channel-sign <manifest>          sign update-channel.json with the project keypair
   channel-verify <manifest>        verify an update-channel.json signature
-  search --github <owner/repo> [name]    list signed Release assets
+  search --github <owner/repo> [name] [--json]  list discovered packages (SIGNED is metadata)
+  info --github <owner/repo> <name>            list versions and marketplace facts
   publish --github <owner/repo> <name>@<version>
   install --github <owner/repo> <name>@<version>
 
@@ -377,6 +383,37 @@ function validateDependencySpec(contract, label) {
   }
 }
 
+// Optional discovery fields are format-checked here; the plugin host alone
+// interprets capabilities and grants.
+function validateMarketplaceFields(metadata, label) {
+  if (
+    metadata.description !== undefined &&
+    (typeof metadata.description !== 'string' || metadata.description.length === 0)
+  ) {
+    throw new CliError(`registry manifest description must be a non-empty string: ${label}`);
+  }
+  if (
+    metadata.keywords !== undefined &&
+    (!Array.isArray(metadata.keywords) ||
+      metadata.keywords.some((word) => typeof word !== 'string' || word.length === 0))
+  ) {
+    throw new CliError(`registry manifest keywords must be an array of strings: ${label}`);
+  }
+  if (
+    metadata.license !== undefined &&
+    (typeof metadata.license !== 'string' || metadata.license.length === 0)
+  ) {
+    throw new CliError(`registry manifest license must be a non-empty string: ${label}`);
+  }
+  if (
+    metadata.capabilities !== undefined &&
+    (!Array.isArray(metadata.capabilities) ||
+      metadata.capabilities.some((name) => typeof name !== 'string' || !CAPABILITY_RE.test(name)))
+  ) {
+    throw new CliError(`registry manifest capabilities must be dotted names: ${label}`);
+  }
+}
+
 function validateManifest(data) {
   if (!plainObject(data)) throw new CliError('manifest must be a JSON object');
   validateName(data.name, 'project name');
@@ -547,6 +584,7 @@ function collectPackage(name, version) {
   if (!sameList(declared, actual)) {
     throw new CliError(`registry file list mismatch for ${name}@${version}`);
   }
+  validateMarketplaceFields(metadata, metadataRelative);
   const files = declared.map((relative) => {
     const target = resolveContained(relative, `registry file ${relative}`, 'file');
     return { path: relative, sha256: hashFile(target.absolute, relative) };
@@ -1330,6 +1368,11 @@ async function commandPublishGithub(repository, contract) {
   }
   const { name, version } = parseSpec(contract, 'publish');
   const pkg = collectPackage(name, version);
+  const manifestRelative = path.posix.join(pkg.path, 'opurom-pkg.json');
+  const manifestBytes = readNoFollow(
+    resolveContained(manifestRelative, 'package manifest', 'file').absolute,
+    manifestRelative,
+  );
   const files = pkg.files.map((file) => {
     const target = resolveContained(file.path, `registry file ${file.path}`, 'file');
     const bytes = readNoFollow(target.absolute, file.path);
@@ -1349,25 +1392,157 @@ async function commandPublishGithub(repository, contract) {
     archive,
     signature,
     digest: sha256(archive),
+    manifestName: manifestAssetName(name, version),
+    manifestBytes,
   });
   process.stdout.write(
     `published ${name}@${version} release=${result.releaseUrl} assets=${result.asset},${result.signature}\n`,
   );
 }
 
-async function commandSearchGithub(repository, positional) {
+// Discovery groups a Releases listing into one directory row per package name.
+// SIGNED is a fact read from asset names, never a verification result.
+function marketPackages(releases, filter) {
+  const packages = new Map();
+  for (const release of releases) {
+    for (const asset of release.assets) {
+      const parsed = parseAssetName(asset);
+      if (!parsed || (filter !== null && parsed.name !== filter)) continue;
+      let entry = packages.get(parsed.name);
+      if (entry === undefined) {
+        entry = new Map();
+        packages.set(parsed.name, entry);
+      }
+      const version = entry.get(parsed.version) ?? {
+        version: parsed.version,
+        tag: release.tag,
+        publishedAt: release.publishedAt,
+        signed: false,
+      };
+      version.signed = version.signed || release.assets.includes(parsed.signature);
+      entry.set(parsed.version, version);
+    }
+  }
+  return [...packages.entries()]
+    .map(([name, versions]) => {
+      const all = [...versions.values()];
+      const ordered = all.slice().sort((left, right) => compareVersionOrder(right.version, left.version));
+      const latest = ordered[0];
+      const body = releases.find((release) => release.tag === latest.tag)?.body;
+      const match = typeof body === 'string' ? /^description:[ \t]*(.*)$/m.exec(body) : null;
+      return {
+        name,
+        versions: all,
+        latest,
+        description:
+          match && match[1].trim().length > 0 ? match[1].trim().replace(/\s+/g, ' ') : '-',
+        signed: `${all.filter((version) => version.signed).length}/${all.length}`,
+      };
+    })
+    .sort((left, right) => compareStrings(left.name, right.name));
+}
+
+function printTruncated() {
+  process.stdout.write('truncated: release listing is limited to one page\n');
+}
+
+async function commandSearchGithub(repository, positional, { json = false } = {}) {
   const name = positional[0] ?? null;
   if (name !== null) validateName(name, 'package name');
-  const rows = await githubRegistry().search({ repository, name });
-  if (rows.length === 0) {
-    process.stdout.write(`no signed packages found in ${repository}\n`);
+  const releases = await githubRegistry().releases({ repository });
+  const truncated = releases.length >= RELEASE_PAGE_LIMIT;
+  const packages = marketPackages(releases, name);
+  if (json) {
+    process.stdout.write(
+      `${JSON.stringify({
+        repository,
+        truncated,
+        packages: packages.map((pkg) => ({
+          name: pkg.name,
+          latest: pkg.latest.version,
+          latestTag: pkg.latest.tag,
+          description: pkg.description,
+          signed: pkg.signed,
+          downloadVolume: 'n/a (no telemetry)',
+        })),
+      })}\n`,
+    );
     return;
   }
-  for (const row of rows) {
-    process.stdout.write(
-      `${row.name}@${row.version} release=${row.releaseUrl} asset=${row.asset}\n`,
-    );
+  if (packages.length === 0) {
+    process.stdout.write(`no signed packages found in ${repository}\n`);
+    if (truncated) printTruncated();
+    return;
   }
+  printRows([
+    ['NAME', 'LATEST', 'DESCRIPTION', 'SIGNED'],
+    ...packages.map((pkg) => [pkg.name, pkg.latest.version, pkg.description, pkg.signed]),
+  ]);
+  if (truncated) printTruncated();
+}
+
+async function commandInfoGithub(repository, positional) {
+  const name = oneArgument('info', positional);
+  validateName(name, 'package name');
+  const registry = githubRegistry();
+  const releases = await registry.releases({ repository });
+  const truncated = releases.length >= RELEASE_PAGE_LIMIT;
+  const entry = marketPackages(releases, name)[0];
+  if (entry === undefined) {
+    process.stdout.write(`no signed packages found in ${repository}\n`);
+    if (truncated) printTruncated();
+    return;
+  }
+  const rows = [['VERSION', 'TAG', 'PUBLISHED', 'DEPENDENCIES', 'SIGNED']];
+  let latestManifest = null;
+  const ordered = entry.versions.slice().sort((left, right) =>
+    compareVersionOrder(right.version, left.version),
+  );
+  for (const version of ordered) {
+    let dependencies = '-';
+    try {
+      const asset = await registry.downloadReleaseAsset({
+        repository,
+        tag: version.tag,
+        asset: manifestAssetName(name, version.version),
+        maximum: MAX_CHANNEL_MANIFEST_BYTES,
+      });
+      const manifest = JSON.parse(asset.bytes.toString('utf8'));
+      if (plainObject(manifest) && plainObject(manifest.dependencies)) {
+        const list = Object.entries(manifest.dependencies)
+          .sort((left, right) => compareStrings(left[0], right[0]))
+          .map(([dependency, contract]) => `${dependency}@${contract}`);
+        if (list.length > 0) dependencies = list.join(', ');
+      }
+      if (version === entry.latest) latestManifest = manifest;
+    } catch (error) {
+      // Releases predating discovery manifests simply have no dependency data.
+      if (!(error instanceof GitHubRegistryError) || !error.message.startsWith('missing release asset:')) {
+        throw error;
+      }
+    }
+    rows.push([
+      version.version,
+      version.tag,
+      version.publishedAt ?? '-',
+      dependencies,
+      version.signed ? 'yes' : 'no',
+    ]);
+  }
+  printRows(rows);
+  const facts = deriveMarketFacts({ versions: entry.versions, manifest: latestManifest, truncated });
+  const present = Object.entries(facts.metadata)
+    .filter(([, value]) => value)
+    .map(([field]) => field);
+  process.stdout.write('\nFACTS\n');
+  process.stdout.write(`  versions          ${facts.versions}\n`);
+  process.stdout.write(`  latest release    ${facts.latestPublishedAt ?? '-'}\n`);
+  process.stdout.write(`  signatures        ${facts.signatures}\n`);
+  process.stdout.write(
+    `  metadata          ${present.length}/4${present.length > 0 ? ` (${present.join(', ')})` : ''}\n`,
+  );
+  process.stdout.write('  download volume   n/a (no telemetry)\n');
+  if (truncated) printTruncated();
 }
 
 // Downloads and verifies one signed package archive, then writes its files.
@@ -1699,8 +1874,13 @@ async function main(argv) {
   } else if (command === 'channel-verify') {
     commandChannelVerify(oneArgument(command, rest));
   } else if (command === 'search') {
-    const { repository, positional } = githubArgs(command, rest, [0, 1]);
-    await commandSearchGithub(repository, positional);
+    const json = rest.includes('--json');
+    const filtered = rest.filter((argument) => argument !== '--json');
+    const { repository, positional } = githubArgs(command, filtered, [0, 1]);
+    await commandSearchGithub(repository, positional, { json });
+  } else if (command === 'info') {
+    const { repository, positional } = githubArgs(command, rest, 1);
+    await commandInfoGithub(repository, positional);
   } else {
     throw new CliError(`unknown command: ${command}\n${USAGE}`, 2);
   }

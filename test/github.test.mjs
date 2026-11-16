@@ -188,8 +188,8 @@ test('mock publish, search and install round trip over real TCP', async (t) => {
     NAME,
   );
   assert.equal(searched.status, 0, searched.output);
-  assert.match(searched.stdout, /opurom-extra@2\.0\.0/);
-  assert.match(searched.stdout, /asset=opurom-pkg-opurom-extra-2\.0\.0\.zip/);
+  assert.match(searched.stdout, /NAME\s+LATEST\s+DESCRIPTION\s+SIGNED/);
+  assert.match(searched.stdout, /opurom-extra\s+2\.0\.0\s+-\s+1\/1/);
   assert.ok(!searched.output.includes(token), 'search output must not contain the token');
 
   const client = seededProject(t);

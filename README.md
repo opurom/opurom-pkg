@@ -128,12 +128,22 @@ SHA-256 in the Release body, creates or patches the Release, and uploads both as
 GitHub REST API using Node's `fetch`. `OPR_GITHUB_TOKEN` is read from the environment only; the token
 is never written to a file, log, stdout or tracked artifact.
 
-`search --github <owner/repo> [name]` lists versions only when the archive, detached signature and
-SHA-256 Release body are all present. `install --github <owner/repo> <name>@<version>` downloads the
+`search --github <owner/repo> [name] [--json]` is the marketplace discovery surface: a
+`NAME/LATEST/DESCRIPTION/SIGNED` table or one JSON line for plugins to consume. `SIGNED` is a
+listing fact (every seen release carries `.sig`), not a verification result — discovery is a
+directory and trust belongs only to a verified `install`. `info --github <owner/repo> <name>`
+lists every version with tag, time, dependencies and signature state, plus a fact panel of
+versions, latest release time, completeness of signatures and four metadata fields, and
+`download volume: n/a (no telemetry)`. No scoring, stars, forks or download counts are inputs.
+A full Releases page prints an explicit `truncated` marker. Package manifests may declare
+`description`, `keywords`, `license` and dotted `capabilities` (format-checked only; the plugin
+host owns grants).
+
+`install --github <owner/repo> <name>@<version>` downloads the
 assets over HTTPS, verifies the Ed25519 signature against the locally provisioned `keys/opurom.pub`,
 checks the archive SHA-256 against the Release body and every file SHA-256 against the signed ZIP
 manifest, then writes files under `registry/`. Transitive packages are resolved by range through
-`search --github` and take the same download, signature and digest checks. It rejects tampering,
+the Release search API and take the same download, signature and digest checks. It rejects tampering,
 wrong keys, missing signatures,
 traversal, unexpected download hosts and bounded-size violations. Public reads do not require a
 token; publishing requires one.
@@ -213,7 +223,9 @@ package that is not fetched again, an honest failure when no remote version sati
 contract, and the same transitive fetch on the GitHub path. The update-channel tests cover the
 sign/verify round trip, a newer-release report, already-up-to-date and tampered-signature
 rejection, manifest/tag mismatch, verified bundle fetch, digest mismatch writing nothing, downgrade
-refusal with explicit override, and the network-unavailable SKIP. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
+refusal with explicit override, and the network-unavailable SKIP. The marketplace-discovery tests
+cover the fact table, `--json` shape, SIGNED as a listing fact, the info fact panel, truncated
+page reporting and metadata format validation. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
 a range with prereleases excluded, byte-identical repeated output, independence from registry directory
 order, an up-to-date project and a missing registry package.
 
