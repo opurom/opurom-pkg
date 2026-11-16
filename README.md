@@ -154,6 +154,33 @@ It uploaded `opurom-pkg-opurom-ui-0.1.0.zip` (1048 bytes) and
 2026-11-12T22:48:03Z. No token appeared in output and no tracked files changed. No other
 repositories were created or deleted.
 
+## OTA update channel
+
+`update` is the application self-update primitive: it reports newer releases and fetches verified
+bundles, and never unpacks, executes or installs anything. It never touches `opurom.json`,
+`opurom.lock` or `registry/` — the lock resolves project dependencies, the channel tracks the
+application itself, and the two version domains never mix.
+
+`update check --github <owner/repo> --current x.y.z` reads the newest release-train tag
+(`vX.Y.Z`, `vX.Y.Z-dev.N`), verifies `update-channel.json` against its detached Ed25519 signature
+(`update-channel.json.sig`, same `keys/opurom.pub` trust anchor and `signBytes`/`verifyBytes`
+semantics as package signatures), refuses a manifest whose `latest` or `tag` disagrees with the
+release tag, and prints `already up to date` or a `LATEST/CURRENT/TAG/BUNDLE/SHA256` report.
+The CLI is stateless: callers reject reports older than the highest version they have seen.
+
+`update fetch --github <owner/repo> --current x.y.z --out <dir> [--version x.y.z]
+[--allow-downgrade]` downloads the manifest, its signature and the bundle, verifies in the
+trust order above, compares the bundle bytes against the manifest `bundleSha256`, and only then
+writes the three files into `--out`. Downgrades are refused unless `--allow-downgrade`; failures
+are loud and write nothing. Bundle downloads are bounded at 256 MiB, independent of package asset
+caps.
+
+`channel-sign <manifest>` signs an `update-channel.json` with the project keypair;
+`channel-verify <manifest>` checks an existing detached signature. The release train publishes
+the manifest, its signature and the framework bundle as Release assets of each train tag;
+v1 transport is the GitHub Release path only, and the signature is transport-independent, so
+mirror hosts can serve the same three artifacts without protocol changes.
+
 ## Tests
 
 ```sh
@@ -183,7 +210,10 @@ shared requirements, a conflict report naming each requirer, backtracking past a
 cycles, malformed registry contracts and transitive lock gaps reported by `verify`. The install-closure
 tests cover the transitive fetch over loopback HTTP and its version-list endpoint, a satisfied local
 package that is not fetched again, an honest failure when no remote version satisfies a transitive
-contract, and the same transitive fetch on the GitHub path. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
+contract, and the same transitive fetch on the GitHub path. The update-channel tests cover the
+sign/verify round trip, a newer-release report, already-up-to-date and tampered-signature
+rejection, manifest/tag mismatch, verified bundle fetch, digest mismatch writing nothing, downgrade
+refusal with explicit override, and the network-unavailable SKIP. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
 a range with prereleases excluded, byte-identical repeated output, independence from registry directory
 order, an up-to-date project and a missing registry package.
 
@@ -200,5 +230,8 @@ order, an up-to-date project and a missing registry package.
   highest version the whole tree allows in the lock. `publish` uses exact versions; `install` takes an
   exact version and resolves its transitive closure by range. Transitive requirements resolve from
   each package's registry manifest; unsatisfiable requirements fail with a conflict report.
+- `update check`/`fetch` form the OTA channel: read-only reporting and verified bundle fetch only.
+  Installation is the application's decision; OTA versions never enter `opurom.lock`, and the
+  channel reuses the package signature stack and publisher key rather than a second scheme.
 - Manifest and lock writes are per-file atomic replacements, not one transaction. `verify` detects
   drift.

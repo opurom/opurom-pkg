@@ -36,11 +36,14 @@ import {
 } from '../lib/package-archive.mjs';
 import {
   GitHubRegistryError,
+  MAX_BUNDLE_BYTES,
+  MAX_CHANNEL_MANIFEST_BYTES,
   RegistryNetworkError,
   assetNames,
   createGithubMockServer,
   createGithubRegistry,
   parseRepository,
+  parseTrainTag,
 } from '../lib/github-registry.mjs';
 import {
   closeServer,
@@ -50,6 +53,7 @@ import {
 import { HttpError, assertIntegrity, expectOk, request } from '../lib/http-client.mjs';
 import {
   compareVersionOrder,
+  compareVersions,
   highestSatisfying,
   parseRange,
   parseVersion,
@@ -58,7 +62,17 @@ import {
 
 // Mutations must never fall back to the tool's own repo: an uninitialized
 // working directory would otherwise silently rewrite the packaged manifest.
-const MUTATING = new Set(['init', 'add', 'remove', 'install', 'lock', 'sign', 'publish']);
+const MUTATING = new Set([
+  'init',
+  'add',
+  'remove',
+  'install',
+  'lock',
+  'sign',
+  'publish',
+  'update',
+  'channel-sign',
+]);
 
 function resolveRoot() {
   const current = realpathSync(process.cwd());
@@ -79,6 +93,7 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 // Local mock registry only: loopback HTTP, no TLS, no remote hosts.
 const DEFAULT_REGISTRY_URL = 'http://127.0.0.1:4873';
+const CHANNEL_MANIFEST = 'update-channel.json';
 
 const USAGE = `usage: opurom-pkg <command>
 
@@ -95,6 +110,13 @@ const USAGE = `usage: opurom-pkg <command>
   github-registry-server [--port N] serve a GitHub API mock on loopback
   publish <name>@<version>         publish over loopback HTTP
   install <name>@<version>         install over loopback HTTP
+  update check --github <owner/repo> --current x.y.z
+                                   report a newer signed channel release
+  update fetch --github <owner/repo> --current x.y.z --out <dir>
+                                   [--version x.y.z] fetch a verified bundle,
+                                   never install
+  channel-sign <manifest>          sign update-channel.json with the project keypair
+  channel-verify <manifest>        verify an update-channel.json signature
   search --github <owner/repo> [name]    list signed Release assets
   publish --github <owner/repo> <name>@<version>
   install --github <owner/repo> <name>@<version>
@@ -1396,6 +1418,201 @@ async function commandInstallGithub(repository, contract) {
   }
 }
 
+// --- OTA update channel ---------------------------------------------------
+
+// Flag-only parser for the update commands; positional arguments are none.
+function updateFlags(command, rest, names) {
+  const booleans = ['allow-downgrade'];
+  const values = new Map();
+  for (let index = 0; index < rest.length; index += 1) {
+    const match = /^--([a-z-]+)$/.exec(rest[index]);
+    if (!match || !names.includes(match[1])) {
+      throw new CliError(`unknown option for ${command}: ${rest[index]}`, 2);
+    }
+    let value;
+    if (booleans.includes(match[1])) {
+      value = 'true';
+    } else {
+      value = rest[index + 1];
+      index += 1;
+      if (value === undefined) {
+        throw new CliError(`${command} --${match[1]} needs a value`, 2);
+      }
+    }
+    if (values.has(match[1])) throw new CliError(`duplicate option --${match[1]}`, 2);
+    values.set(match[1], value);
+  }
+  return values;
+}
+
+// The channel head is the newest release-train tag. Package tags and drafts
+// are not channel candidates.
+function pickChannelRelease(releases) {
+  const tagged = releases
+    .map((release) => ({ ...release, version: parseTrainTag(release.tag)?.version ?? null }))
+    .filter((release) => release.version !== null)
+    .sort((left, right) => compareVersionOrder(right.version, left.version));
+  return tagged[0] ?? null;
+}
+
+function parseChannelManifest(bytes, tag) {
+  let manifest;
+  try {
+    manifest = JSON.parse(bytes.toString('utf8'));
+  } catch {
+    throw new CliError(`invalid channel manifest: ${CHANNEL_MANIFEST}`);
+  }
+  if (!plainObject(manifest) || manifest.version !== 1) {
+    throw new CliError(`unsupported channel manifest version in ${CHANNEL_MANIFEST}`);
+  }
+  for (const field of ['channel', 'latest', 'tag', 'bundle']) {
+    if (typeof manifest[field] !== 'string' || manifest[field].length === 0) {
+      throw new CliError(`channel manifest ${field} must be a non-empty string`);
+    }
+  }
+  if (typeof manifest.bundleSha256 !== 'string' || !SHA256_RE.test(manifest.bundleSha256)) {
+    throw new CliError('invalid bundleSha256 in channel manifest');
+  }
+  if (manifest.tag !== tag) {
+    throw new CliError(`channel manifest tag ${manifest.tag} does not match release tag ${tag}`);
+  }
+  if (!parseVersion(manifest.latest) || manifest.latest !== parseTrainTag(tag).version) {
+    throw new CliError(
+      `channel manifest latest ${manifest.latest} does not match release tag ${tag}`,
+    );
+  }
+  assertRelative(manifest.bundle, 'bundle asset');
+  return manifest;
+}
+
+// Trust order per the lockfile spec: the manifest signature comes first, so
+// the recorded bundle digest is only trusted after it verifies.
+async function loadVerifiedManifest(registry, repository, tag) {
+  const manifest = await registry.downloadReleaseAsset({
+    repository,
+    tag,
+    asset: CHANNEL_MANIFEST,
+    maximum: MAX_CHANNEL_MANIFEST_BYTES,
+  });
+  const signature = await registry.downloadReleaseAsset({
+    repository,
+    tag,
+    asset: `${CHANNEL_MANIFEST}.sig`,
+    maximum: MAX_CHANNEL_MANIFEST_BYTES,
+  });
+  const publicKey = readPublicKey(ROOT);
+  if (!verifyBytes(publicKey, CHANNEL_MANIFEST, manifest.bytes, signature.bytes)) {
+    throw new CliError(`invalid signature: ${CHANNEL_MANIFEST}.sig`);
+  }
+  return { ...parseChannelManifest(manifest.bytes, tag), bytes: manifest.bytes, signature: signature.bytes };
+}
+
+async function resolveChannelTarget(registry, repository, requested) {
+  const releases = await registry.releases({ repository });
+  const release = requested === null
+    ? pickChannelRelease(releases)
+    : releases.find((entry) => parseTrainTag(entry.tag)?.version === requested) ?? null;
+  if (release === null) {
+    throw new CliError(
+      requested === null
+        ? `no release train tags found in ${repository}`
+        : `no release for version ${requested} in ${repository}`,
+    );
+  }
+  const manifest = await loadVerifiedManifest(registry, repository, release.tag);
+  return { release, manifest };
+}
+
+async function commandUpdateCheck(rest) {
+  const flags = updateFlags('update check', rest, ['github', 'current']);
+  const repository = flags.get('github');
+  const current = flags.get('current');
+  if (!repository) throw new CliError('update check needs --github <owner/repo>', 2);
+  if (!current) throw new CliError('update check needs --current <x.y.z>', 2);
+  if (!parseVersion(current)) throw new CliError(`invalid current version: ${current}`);
+  const registry = githubRegistry();
+  const { release, manifest } = await resolveChannelTarget(registry, repository, null);
+  if (compareVersions(manifest.latest, current) <= 0) {
+    process.stdout.write('already up to date\n');
+    return;
+  }
+  printRows([
+    ['LATEST', 'CURRENT', 'TAG', 'BUNDLE', 'SHA256'],
+    [manifest.latest, current, release.tag, manifest.bundle, manifest.bundleSha256],
+  ]);
+}
+
+async function commandUpdateFetch(rest) {
+  const flags = updateFlags('update fetch', rest, [
+    'github',
+    'current',
+    'version',
+    'out',
+    'allow-downgrade',
+  ]);
+  const repository = flags.get('github');
+  const current = flags.get('current');
+  const out = flags.get('out');
+  const requested = flags.get('version') ?? null;
+  if (!repository) throw new CliError('update fetch needs --github <owner/repo>', 2);
+  if (!current) throw new CliError('update fetch needs --current <x.y.z>', 2);
+  if (!parseVersion(current)) throw new CliError(`invalid current version: ${current}`);
+  if (!out) throw new CliError('update fetch needs --out <directory>', 2);
+  assertRelative(out, 'output directory');
+  if (requested !== null && !parseVersion(requested)) {
+    throw new CliError(`invalid requested version: ${requested}`);
+  }
+  const registry = githubRegistry();
+  const { release, manifest } = await resolveChannelTarget(registry, repository, requested);
+  const target = requested ?? manifest.latest;
+  if (compareVersions(target, current) < 0 && !flags.has('allow-downgrade')) {
+    throw new CliError(
+      `refusing downgrade: requested ${target} < current ${current} (use --allow-downgrade)`,
+    );
+  }
+  if (compareVersions(target, current) === 0) {
+    process.stdout.write('already up to date\n');
+    return;
+  }
+  const bundle = await registry.downloadReleaseAsset({
+    repository,
+    tag: release.tag,
+    asset: manifest.bundle,
+    maximum: MAX_BUNDLE_BYTES,
+  });
+  const digest = sha256(bundle.bytes);
+  if (digest !== manifest.bundleSha256) {
+    throw new CliError(
+      `sha256 mismatch: ${manifest.bundle} (expected ${manifest.bundleSha256}, got ${digest})`,
+    );
+  }
+  // Every check has passed; the three channel files are written last.
+  writeInstalledFile(path.posix.join(out, CHANNEL_MANIFEST), manifest.bytes);
+  writeInstalledFile(path.posix.join(out, `${CHANNEL_MANIFEST}.sig`), manifest.signature);
+  writeInstalledFile(path.posix.join(out, manifest.bundle), bundle.bytes, manifest.bundleSha256);
+  process.stdout.write(
+    `fetched ${manifest.latest} bundle ${manifest.bundle} (${bundle.bytes.length} bytes) to ${out}\n`,
+  );
+}
+
+function commandChannelSign(relative) {
+  assertRelative(relative, 'channel manifest');
+  const file = resolveContained(relative, 'channel manifest', 'file');
+  const bytes = readNoFollow(file.absolute, relative);
+  const { privateKey, publicKeyPath, created } = loadOrCreateKeypair(ROOT);
+  writeSignature(ROOT, relative, signBytes(privateKey, relative, bytes));
+  process.stdout.write(
+    `signed ${relative} with ${path.basename(publicKeyPath)}${created ? ' (new keypair created)' : ''}\n`,
+  );
+}
+
+function commandChannelVerify(relative) {
+  assertRelative(relative, 'channel manifest');
+  const publicKey = readPublicKey(ROOT);
+  const errors = verifySignatureFile(publicKey, relative);
+  report([{ label: relative, detail: 'channel manifest signature', errors }]);
+}
+
 async function main(argv) {
   const [command, ...rest] = argv;
   if (!command) {
@@ -1468,6 +1685,19 @@ async function main(argv) {
     } else {
       await commandInstall(oneArgument(command, rest));
     }
+  } else if (command === 'update') {
+    const sub = rest[0];
+    if (sub === 'check') {
+      await commandUpdateCheck(rest.slice(1));
+    } else if (sub === 'fetch') {
+      await commandUpdateFetch(rest.slice(1));
+    } else {
+      throw new CliError('update needs check or fetch', 2);
+    }
+  } else if (command === 'channel-sign') {
+    commandChannelSign(oneArgument(command, rest));
+  } else if (command === 'channel-verify') {
+    commandChannelVerify(oneArgument(command, rest));
   } else if (command === 'search') {
     const { repository, positional } = githubArgs(command, rest, [0, 1]);
     await commandSearchGithub(repository, positional);
