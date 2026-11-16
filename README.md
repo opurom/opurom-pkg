@@ -28,7 +28,7 @@ node bin/opurom-pkg.mjs publish --github opurom/opurom-pkg opurom-ui@0.1.0
 node bin/opurom-pkg.mjs install --github opurom/opurom-pkg opurom-ui@0.1.0
 ```
 
-`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one `name@x.y.z` pin, or a SemVer 2.0 comparator range such as `>=0.1.0 <0.2.0`, from `registry/<name>/<version>/` and refreshes both the manifest and lock. A range selects the highest stable version by SemVer precedence and pins that exact version in `opurom.lock`; the manifest keeps the range. Prereleases never satisfy a stable range and are only reachable through an exact pin or a range with a prerelease comparator for the same `major.minor.patch`. Versions equal by precedence (differing only in build metadata) are ordered by raw text, so selection is deterministic. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry and refreshes the recorded manifest digest. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged. `outdated` writes nothing: for every package in `opurom.lock` it prints `LOCKED` (the pinned version), `WANTED` (what the manifest contract resolves to today) and `LATEST` (the highest stable version in `registry/`, prereleases excluded) in name order, shows only rows where `LOCKED` differs from `WANTED` or `LATEST`, and prints `all locked packages are up to date` when every lock entry matches. `show <name>` prints one locked package's row (name, version, file count, path and package SHA-256) followed by its sorted per-file checksums, resolved from `opurom.lock` alone; it writes nothing and exits nonzero when the name is not locked.
+`init` writes `opurom.json` with `name`, `version`, `moduleRoots` and `dependencies`, plus an empty deterministic `opurom.lock`. `add` resolves one `name@x.y.z` pin, or a SemVer 2.0 comparator range such as `>=0.1.0 <0.2.0`, from `registry/<name>/<version>/` and refreshes both the manifest and lock. A range selects the highest stable version by SemVer precedence and pins that exact version in `opurom.lock`; the manifest keeps the range. Prereleases never satisfy a stable range and are only reachable through an exact pin or a range with a prerelease comparator for the same `major.minor.patch`. Versions equal by precedence (differing only in build metadata) are ordered by raw text, so selection is deterministic. A registry package's `opurom-pkg.json` may declare its own `dependencies`; `lock` resolves the whole reachable tree, pins one version per package name that satisfies every requirement reaching it, and fails with a conflict report that names each unsatisfied requirement and the package that declared it. `remove` refreshes both after deleting a dependency. `lock` regenerates only the lock from the manifest and registry and refreshes the recorded manifest digest. `lock --check` reads the manifest, registry and lockfile, compares the lockfile byte for byte with a fresh deterministic regeneration, and writes nothing. It prints the package count on success and exits nonzero with a stale-lock error when they differ, including formatting changes that leave every file digest unchanged. `outdated` writes nothing: for every package in `opurom.lock` it prints `LOCKED` (the pinned version), `WANTED` (what the dependency tree resolves to today) and `LATEST` (the highest stable version in `registry/`, prereleases excluded) in name order, shows only rows where `LOCKED` differs from `WANTED` or `LATEST`, and prints `all locked packages are up to date` when every lock entry matches. `show <name>` prints one locked package's row (name, version, file count, path and package SHA-256) followed by its sorted per-file checksums, resolved from `opurom.lock` alone; it writes nothing and exits nonzero when the name is not locked.
 
 Commands run against the current directory. When the current directory has no `opurom.json` and no
 `registry/`, the CLI falls back to the package directory that owns the script, so
@@ -74,7 +74,7 @@ Each registry package has `opurom-pkg.json` with `name`, `version` and an exact 
 
 ## Trust boundary
 
-`verify` reads `opurom.json` and `opurom.lock`, recomputes the deterministic winner for every dependency (an exact pin wins directly; a range must resolve to the version pinned in the lock), recomputes SHA-256 of every locked file, recomputes each package digest, checks for missing or extra files, and rejects absolute paths, `..` traversal and symlinks. All paths must resolve inside the project root. A lock entry pointing at any other version, including a prerelease that a stable range excludes, is reported as version drift. Any failure prints `FAIL` details and exits nonzero.
+`verify` reads `opurom.json` and `opurom.lock`, recomputes the dependency tree against `registry/` (an exact pin must equal the locked version; ranges and transitive requirements must re-resolve to the locked versions), recomputes SHA-256 of every locked file, recomputes each package digest, checks for missing or extra files, and rejects absolute paths, `..` traversal and symlinks. All paths must resolve inside the project root. A lock entry pointing at any other version, including a prerelease that a stable range excludes, is reported as version drift. Any failure prints `FAIL` details and exits nonzero.
 
 `add`, `lock` and `verify` never import or run `.opu` files. They hash bytes only. SHA-256 is an integrity check, not publisher authenticity.
 
@@ -174,7 +174,9 @@ integrity rejection, wrong-key and missing-signature rejection, bounded-size and
 rejection, and `SKIP` without a token or network. The version-resolution tests use temporary
 registries with no network: exact pins, stable-range precedence, prerelease exclusion, deterministic
 selection and build-metadata ties, leading-zero rejection, and tampered lockfile entries or signatures.
-The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
+The dependency-tree tests cover transitive resolution into the lock, one pinned version satisfying
+shared requirements, a conflict report naming each requirer, backtracking past an earlier choice,
+cycles, malformed registry contracts and transitive lock gaps reported by `verify`. The outdated tests cover a newer registry version with an untouched lockfile, a wanted upgrade inside
 a range with prereleases excluded, byte-identical repeated output, independence from registry directory
 order, an up-to-date project and a missing registry package.
 
@@ -188,7 +190,8 @@ order, an up-to-date project and a missing registry package.
   the tool does not distribute, rotate or revoke keys and does not verify publisher identity.
 - Packages are hashed and copied as bytes. No package code is executed.
 - Local `add`, `lock` and `verify` accept exact SemVer 2.0 pins or comparator ranges; ranges pin the
-  highest stable version in the lock. `publish`/`install` (local and GitHub) still use exact
-  versions. No transitive dependency graph resolution.
+  highest version the whole tree allows in the lock. `publish`/`install` (local and GitHub) still use
+  exact versions. Transitive requirements resolve from each package's registry manifest; unsatisfiable
+  requirements fail with a conflict report.
 - Manifest and lock writes are per-file atomic replacements, not one transaction. `verify` detects
   drift.

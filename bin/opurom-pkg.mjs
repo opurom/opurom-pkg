@@ -48,7 +48,13 @@ import {
   listenLoopback,
 } from '../lib/registry.mjs';
 import { HttpError, assertIntegrity, expectOk, request } from '../lib/http-client.mjs';
-import { highestSatisfying, parseRange, parseVersion } from '../lib/semver.mjs';
+import {
+  compareVersionOrder,
+  highestSatisfying,
+  parseRange,
+  parseVersion,
+  satisfies,
+} from '../lib/semver.mjs';
 
 // Mutations must never fall back to the tool's own repo: an uninitialized
 // working directory would otherwise silently rewrite the packaged manifest.
@@ -95,9 +101,12 @@ const USAGE = `usage: opurom-pkg <command>
 
 Run from the project root. publish/install use exact x.y.z versions; add also
 accepts SemVer 2.0 comparator ranges such as ">=1.0.0 <2.0.0", which pin the
-highest stable version in opurom.lock. Every lock write records the SHA-256 of
-opurom.json; verify --signed compares the manifest with that signed digest, and
-lock refreshes it after a legitimate edit.
+highest stable version in opurom.lock. Registry packages may declare their own
+dependencies; the reachable tree resolves to one consistent version per
+package, and conflicting requirements are reported with their requirers.
+Every lock write records the SHA-256 of opurom.json; verify --signed compares
+the manifest with that signed digest, and lock refreshes it after a
+legitimate edit.
 Local publish/install use Opurom_REGISTRY_URL (loopback HTTP only).
 --github uses https://api.github.com, or Opurom_GITHUB_API_URL for a loopback mock.
 Publishing reads OPR_GITHUB_TOKEN from the environment only.`;
@@ -528,6 +537,34 @@ function collectPackage(name, version) {
   };
 }
 
+// Requirement edges for one registry version, validated and name-sorted.
+// Read-only resolution tolerates a version directory with no manifest;
+// collecting files for the lock still refuses it.
+function registryDependencies(name, version) {
+  const metadataRelative = path.posix.join(registryPath(name, version), 'opurom-pkg.json');
+  let metadata;
+  try {
+    metadata = readJsonAt(metadataRelative, `registry manifest for ${name}@${version}`);
+  } catch (error) {
+    if (error instanceof CliError && error.message.startsWith('missing ')) return [];
+    throw error;
+  }
+  if (!plainObject(metadata)) {
+    throw new CliError(`registry manifest must be a JSON object: ${metadataRelative}`);
+  }
+  if (metadata.dependencies === undefined) return [];
+  if (!plainObject(metadata.dependencies)) {
+    throw new CliError(`registry manifest dependencies must be an object: ${metadataRelative}`);
+  }
+  const dependencies = Object.entries(metadata.dependencies).map(([dependencyName, contract]) => {
+    validateName(dependencyName, 'dependency name');
+    validateDependencySpec(contract, `dependency ${dependencyName} of ${name}@${version}`);
+    return [dependencyName, contract];
+  });
+  dependencies.sort((left, right) => compareStrings(left[0], right[0]));
+  return dependencies;
+}
+
 // Only version directories are candidates; a malformed one is a hard error so
 // a leading-zero version can never win by accident.
 function registryVersions(name) {
@@ -547,21 +584,130 @@ function registryVersions(name) {
   return versions;
 }
 
-function resolveSpec(name, contract) {
-  const range = parseRange(contract);
-  if (!range) {
-    throw new CliError(
-      `invalid version for ${name}: ${String(contract)}; use SemVer 2.0 x.y.z or a comparator range`,
-    );
+// The reachable dependency tree resolves to one version per package name: the
+// requirements that reach a name accumulate, and a version must satisfy all of
+// them. Search walks names in discovery order, tries candidates highest first
+// and backtracks when a later requirement invalidates an earlier choice.
+// Candidate and requirement lists are sorted, so registry directory order
+// never changes the outcome.
+// shortcut: the step budget bounds pathological backtracking, raise it for graphs that outgrow it.
+const MAX_RESOLUTION_STEPS = 20000;
+
+function resolveTree(rootDependencies) {
+  const edges = new Map();
+  const order = [];
+  const chosen = new Map();
+  let steps = 0;
+  let conflict = null;
+
+  function record(name, contract, by) {
+    let requirements = edges.get(name);
+    if (requirements === undefined) {
+      requirements = [];
+      edges.set(name, requirements);
+      order.push(name);
+    }
+    requirements.push({ contract, by });
   }
-  if (range.exact) return contract;
-  const winner = highestSatisfying(range, registryVersions(name));
-  if (winner === null) throw new CliError(`no version of ${name} satisfies ${contract}`);
-  return winner;
+
+  function snapshot() {
+    return {
+      order: [...order],
+      edges: new Map([...edges].map(([name, list]) => [name, [...list]])),
+      chosen: new Map(chosen),
+    };
+  }
+
+  function restore(state) {
+    order.length = 0;
+    order.push(...state.order);
+    edges.clear();
+    for (const [name, list] of state.edges) edges.set(name, list);
+    chosen.clear();
+    for (const [name, version] of state.chosen) chosen.set(name, version);
+  }
+
+  // Registry versions satisfying every recorded requirement, highest first.
+  // An exact pin whose package is absent reports the missing path directly.
+  function candidates(name) {
+    const requirements = edges.get(name);
+    const pinned = requirements.find(({ contract }) => parseRange(contract).exact);
+    if (pinned !== undefined) {
+      const version = parseRange(pinned.contract).version.raw;
+      const expected = registryPath(name, version);
+      if (!existsSync(path.join(ROOT, expected))) {
+        throw new CliError(`unknown local package: ${name}@${version} (expected ${expected})`);
+      }
+    }
+    const ranges = requirements.map(({ contract }) => parseRange(contract));
+    return registryVersions(name)
+      .filter((version) => ranges.every((range) => satisfies(version, range)))
+      .sort((left, right) => compareVersionOrder(right, left));
+  }
+
+  function choiceHolds(name) {
+    const version = chosen.get(name);
+    return edges.get(name).every(({ contract }) => satisfies(version, parseRange(contract)));
+  }
+
+  function noteConflict(name, index) {
+    if (conflict === null || index > conflict.index) {
+      conflict = { name, index, requirements: [...edges.get(name)] };
+    }
+  }
+
+  function search(index) {
+    if (index === order.length) return true;
+    const name = order[index];
+    const versions = candidates(name);
+    if (versions.length === 0) {
+      noteConflict(name, index);
+      return false;
+    }
+    for (const version of versions) {
+      steps += 1;
+      if (steps > MAX_RESOLUTION_STEPS) {
+        throw new CliError(`dependency resolution exceeded ${MAX_RESOLUTION_STEPS} steps`);
+      }
+      const before = snapshot();
+      chosen.set(name, version);
+      let consistent = true;
+      for (const [dependency, contract] of registryDependencies(name, version)) {
+        record(dependency, contract, `${name}@${version}`);
+        if (chosen.has(dependency) && !choiceHolds(dependency)) {
+          consistent = false;
+          if (candidates(dependency).length === 0) {
+            noteConflict(dependency, order.indexOf(dependency));
+          }
+          break;
+        }
+      }
+      if (consistent && search(index + 1)) return true;
+      restore(before);
+    }
+    return false;
+  }
+
+  for (const [name, contract] of rootDependencies) record(name, contract, 'opurom.json');
+  if (!search(0)) {
+    if (conflict !== null) {
+      const lines = [`dependency conflict: ${conflict.name}`];
+      for (const { contract, by } of conflict.requirements) {
+        lines.push(`  ${by} requires ${contract}`);
+      }
+      lines.push(`  no version of ${conflict.name} satisfies all constraints`);
+      throw new CliError(lines.join('\n'));
+    }
+    throw new CliError('dependency resolution failed: no consistent version set');
+  }
+  return order.map((name) => ({ name, version: chosen.get(name) }));
 }
 
+// The lock records resolved files only; requirement edges stay in the manifests.
 function buildPackages(dependencies) {
-  return dependencies.map(([name, contract]) => collectPackage(name, resolveSpec(name, contract)));
+  return resolveTree(dependencies)
+    .map(({ name, version }) => collectPackage(name, version))
+    .sort(comparePackages);
 }
 
 // The signed lockfile attests to the manifest bytes that produced it.
@@ -705,20 +851,28 @@ function commandShow(name) {
   }
 }
 
-// Compares every locked version with what the manifest contract resolves to today
+// Compares every locked version with what the dependency tree resolves to today
 // and with the highest stable registry version. Read-only, so the byte-stable
 // lockfile contract is untouched; rows keep the lock's name order.
 function commandOutdated() {
   const manifest = readManifestFile();
-  const contracts = new Map(manifest.dependencies);
+  const lockedPackages = readLockFile();
+  // The latest column reads registry/ first, so a removed package keeps its
+  // original error before tree resolution reports anything else.
+  const latest = new Map(
+    lockedPackages.map((pkg) => [
+      pkg.name,
+      highestSatisfying(parseRange('>=0.0.0'), registryVersions(pkg.name)) ?? '-',
+    ]),
+  );
+  const wanted = new Map(
+    resolveTree(manifest.dependencies).map((entry) => [entry.name, entry.version]),
+  );
   const rows = [['NAME', 'LOCKED', 'WANTED', 'LATEST']];
-  for (const pkg of readLockFile()) {
-    const contract = contracts.get(pkg.name);
-    const wanted = contract === undefined ? '-' : resolveSpec(pkg.name, contract);
-    const latest =
-      highestSatisfying(parseRange('>=0.0.0'), registryVersions(pkg.name)) ?? '-';
-    if (pkg.version === wanted && pkg.version === latest) continue;
-    rows.push([pkg.name, pkg.version, wanted, latest]);
+  for (const pkg of lockedPackages) {
+    const wantedVersion = wanted.get(pkg.name) ?? '-';
+    if (pkg.version === wantedVersion && pkg.version === latest.get(pkg.name)) continue;
+    rows.push([pkg.name, pkg.version, wantedVersion, latest.get(pkg.name)]);
   }
   if (rows.length === 1) {
     process.stdout.write('all locked packages are up to date\n');
@@ -736,19 +890,32 @@ function manifestDriftErrors(dependencies, packages) {
       errors.push(`missing locked package: ${name}@${contract}`);
       continue;
     }
-    let winner;
-    try {
-      winner = resolveSpec(name, contract);
-    } catch (error) {
-      errors.push(errorText(error));
+    const range = parseRange(contract);
+    if (range.exact && locked.get(name) !== contract) {
+      errors.push(`version drift: ${name} expected ${contract}, lock has ${locked.get(name)}`);
+    }
+  }
+  // The tree pass owns range contracts: backtracking may pin below the
+  // standalone highest version when another requirement forbids it.
+  if (errors.length > 0) return errors;
+  let resolved;
+  try {
+    resolved = resolveTree(dependencies);
+  } catch (error) {
+    return [errorText(error)];
+  }
+  const resolvedNames = new Set(resolved.map((entry) => entry.name));
+  for (const { name, version } of resolved) {
+    if (!locked.has(name)) {
+      errors.push(`missing locked package: ${name}@${version} (transitive)`);
       continue;
     }
-    if (locked.get(name) !== winner) {
-      errors.push(`version drift: ${name} expected ${winner}, lock has ${locked.get(name)}`);
+    if (locked.get(name) !== version) {
+      errors.push(`version drift: ${name} expected ${version}, lock has ${locked.get(name)}`);
     }
   }
   for (const [name, version] of locked) {
-    if (!expected.has(name)) errors.push(`unexpected locked package: ${name}@${version}`);
+    if (!resolvedNames.has(name)) errors.push(`unexpected locked package: ${name}@${version}`);
   }
   return errors;
 }
