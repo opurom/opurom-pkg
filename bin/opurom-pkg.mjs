@@ -433,7 +433,29 @@ function validateManifest(data) {
     return [name, version];
   });
   dependencies.sort((left, right) => compareStrings(left[0], right[0]));
-  return { data, dependencies };
+
+  // Only the root package's dev dependencies are resolved; dependency
+  // manifests never contribute theirs, matching pub's solve boundary.
+  let devDependencies = [];
+  if (data.devDependencies !== undefined) {
+    if (!plainObject(data.devDependencies)) {
+      throw new CliError('devDependencies must be an object');
+    }
+    devDependencies = Object.entries(data.devDependencies).map(([name, version]) => {
+      validateName(name, 'dev dependency name');
+      validateDependencySpec(version, `dev dependency ${name}`);
+      return [name, version];
+    });
+    const prod = new Set(dependencies.map(([name]) => name));
+    for (const [name] of devDependencies) {
+      if (prod.has(name)) throw new CliError(`dependency ${name} declared twice`);
+    }
+    devDependencies.sort((left, right) => compareStrings(left[0], right[0]));
+  }
+  const root = [...dependencies, ...devDependencies].sort((left, right) =>
+    compareStrings(left[0], right[0]),
+  );
+  return { data, dependencies, devDependencies, root };
 }
 
 function readManifestFile() {
@@ -875,13 +897,13 @@ function commandInit(name) {
 
 // Updates opurom.json and opurom.lock after a dependency became available locally.
 function applyDependency(name, version) {
-  const { data, dependencies } = readManifestFile();
+  const { data, dependencies, devDependencies } = readManifestFile();
   const byName = new Map(dependencies);
   byName.set(name, version);
   const nextDependencies = [...byName].sort((left, right) =>
     compareStrings(left[0], right[0]),
   );
-  const packages = buildPackages(nextDependencies);
+  const packages = buildPackages([...nextDependencies, ...devDependencies]);
   writeProjectState(data, nextDependencies, packages);
   return packages.find((pkg) => pkg.name === name);
 }
@@ -894,19 +916,19 @@ function commandAdd(contract) {
 
 function commandRemove(name) {
   validateName(name, 'package name');
-  const { data, dependencies } = readManifestFile();
+  const { data, dependencies, devDependencies } = readManifestFile();
   if (!dependencies.some(([dependencyName]) => dependencyName === name)) {
     throw new CliError(`unknown dependency: ${name}`);
   }
   const nextDependencies = dependencies.filter(([dependencyName]) => dependencyName !== name);
-  const packages = buildPackages(nextDependencies);
+  const packages = buildPackages([...nextDependencies, ...devDependencies]);
   writeProjectState(data, nextDependencies, packages);
   process.stdout.write(`removed ${name} (${packages.length} packages remain)\n`);
 }
 
 function commandLock() {
-  const { dependencies } = readManifestFile();
-  const packages = buildPackages(dependencies);
+  const { root } = readManifestFile();
+  const packages = buildPackages(root);
   writeLock(packages);
   process.stdout.write(`regenerated opurom.lock (${packages.length} packages)\n`);
 }
@@ -917,8 +939,8 @@ function commandLockCheck() {
   if (!existsSync(lockPath)) {
     throw new CliError('missing opurom.lock; run lock first');
   }
-  const { dependencies } = readManifestFile();
-  const packages = buildPackages(dependencies);
+  const { root } = readManifestFile();
+  const packages = buildPackages(root);
   const expected = stableJson(lockData(packages));
   const actual = readNoFollow(lockPath, 'opurom.lock', 'utf8');
   if (actual !== expected) {
@@ -977,7 +999,7 @@ function commandOutdated() {
     ]),
   );
   const wanted = new Map(
-    resolveTree(manifest.dependencies).map((entry) => [entry.name, entry.version]),
+    resolveTree(manifest.root).map((entry) => [entry.name, entry.version]),
   );
   const rows = [['NAME', 'LOCKED', 'WANTED', 'LATEST']];
   for (const pkg of lockedPackages) {
@@ -1092,7 +1114,7 @@ function commandVerify() {
     {
       label: '<manifest>',
       detail: 'dependencies match opurom.lock',
-      errors: manifestDriftErrors(manifest.dependencies, packages),
+      errors: manifestDriftErrors(manifest.root, packages),
     },
   ];
   for (const pkg of packages) {
