@@ -308,3 +308,37 @@ test('an existing exact-pin lock keeps its bytes and resolution', (t) => {
   ok(root, 'lock');
   assert.equal(readFileSync(path.join(root, 'opurom.lock'), 'utf8'), before);
 });
+
+test('any and spaced comparators follow pub constraint syntax', () => {
+  const any = parseRange(' any ');
+  assert.equal(any.any, true);
+  assert.equal(satisfies('1.0.0', any), true);
+  assert.equal(satisfies('2.0.0-preview.1', any), true);
+
+  const spaced = parseRange('>= 1.0.0 < 2.0.0');
+  assert.deepEqual(
+    spaced.comparators.map((comparator) => `${comparator.operator}${comparator.version.raw}`),
+    ['>=1.0.0', '<2.0.0'],
+  );
+  assert.equal(satisfies('1.5.0', spaced), true);
+  assert.equal(satisfies('2.0.0', spaced), false);
+  assert.equal(parseRange('>= 1.0.0 <'), null);
+  assert.equal(parseRange('any <2.0.0'), null);
+});
+
+test('any and spaced ranges resolve through the CLI without changing lock bytes', (t) => {
+  const anyRoot = rangedProject(t, ['1.0.0', '2.0.0-preview.1'], 'any');
+  ok(anyRoot, 'lock');
+  assert.equal(lockedVersion(anyRoot), '2.0.0-preview.1');
+  assert.match(ok(anyRoot, 'verify').stdout, /2\/2 checks passed/);
+  const before = readFileSync(path.join(anyRoot, 'opurom.lock'), 'utf8');
+  assert.match(ok(anyRoot, 'lock', '--check').stdout, /up to date \(1 packages\)/);
+  ok(anyRoot, 'lock');
+  assert.equal(readFileSync(path.join(anyRoot, 'opurom.lock'), 'utf8'), before);
+
+  const spacedRoot = rangedProject(t, ['1.0.0', '1.9.0', '2.0.0'], '>= 1.0.0 < 2.0.0');
+  ok(spacedRoot, 'lock');
+  assert.equal(lockedVersion(spacedRoot), '1.9.0');
+  assert.match(ok(spacedRoot, 'verify').stdout, /2\/2 checks passed/);
+  assert.match(ok(spacedRoot, 'lock', '--check').stdout, /up to date \(1 packages\)/);
+});

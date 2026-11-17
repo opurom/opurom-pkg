@@ -238,8 +238,9 @@ order, an up-to-date project and a missing registry package.
 - Ed25519 signatures use a local keypair. The publisher public key must be provisioned out of band;
   the tool does not distribute, rotate or revoke keys and does not verify publisher identity.
 - Packages are hashed and copied as bytes. No package code is executed.
-- Local `add`, `lock` and `verify` accept exact SemVer 2.0 pins or comparator ranges; ranges pin the
-  highest version the whole tree allows in the lock. `publish` uses exact versions; `install` takes an
+- Local `add`, `lock` and `verify` accept exact SemVer 2.0 pins, `^` caret ranges, `any`, or
+  comparator ranges; ranges pin the highest version the whole tree allows in the lock. `any` also
+  admits prereleases. `publish` uses exact versions; `install` takes an
   exact version and resolves its transitive closure by range. Transitive requirements resolve from
   each package's registry manifest; unsatisfiable requirements fail with a conflict report.
 - `update check`/`fetch` form the OTA channel: read-only reporting and verified bundle fetch only.

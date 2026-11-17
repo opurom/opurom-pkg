@@ -128,8 +128,8 @@ const USAGE = `usage: opurom-pkg <command>
   install --github <owner/repo> <name>@<version>
 
 Run from the project root. publish/install use exact x.y.z versions; add also
-accepts SemVer 2.0 comparator ranges such as ">=1.0.0 <2.0.0", which pin the
-highest stable version in opurom.lock. Registry packages may declare their own
+accepts SemVer 2.0 comparator ranges, ^ caret ranges and any, which pin the
+highest stable version in opurom.lock (prereleases need any or a prerelease bound). Registry packages may declare their own
 dependencies; the reachable tree resolves to one consistent version per
 package, and conflicting requirements are reported with their requirers.
 install also fetches every transitive dependency the local registry cannot
@@ -378,7 +378,7 @@ function validateVersion(version, label) {
 function validateDependencySpec(contract, label) {
   if (!parseRange(contract)) {
     throw new CliError(
-      `invalid version for ${label}: ${String(contract)}; use SemVer 2.0 x.y.z, ^x.y.z (alone), or a comparator range`,
+      `invalid version for ${label}: ${String(contract)}; use SemVer 2.0 x.y.z, ^x.y.z (alone), any, or a comparator range`,
     );
   }
 }
