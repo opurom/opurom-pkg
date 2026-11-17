@@ -455,7 +455,22 @@ function validateManifest(data) {
   const root = [...dependencies, ...devDependencies].sort((left, right) =>
     compareStrings(left[0], right[0]),
   );
-  return { data, dependencies, devDependencies, root };
+
+  // A root override replaces every requirement on that name in the graph, so
+  // it may pin a version other requirers forbid.
+  let overrides = [];
+  if (data.dependencyOverrides !== undefined) {
+    if (!plainObject(data.dependencyOverrides)) {
+      throw new CliError('dependencyOverrides must be an object');
+    }
+    overrides = Object.entries(data.dependencyOverrides).map(([name, contract]) => {
+      validateName(name, 'override name');
+      validateDependencySpec(contract, `override ${name}`);
+      return [name, contract];
+    });
+    overrides.sort((left, right) => compareStrings(left[0], right[0]));
+  }
+  return { data, dependencies, devDependencies, root, overrides };
 }
 
 function readManifestFile() {
@@ -676,12 +691,13 @@ function registryVersions(name) {
 // shortcut: the step budget bounds pathological backtracking, raise it for graphs that outgrow it.
 const MAX_RESOLUTION_STEPS = 20000;
 
-function resolveTree(rootDependencies) {
+function resolveTree(rootDependencies, overrides = []) {
   const edges = new Map();
   const order = [];
   const chosen = new Map();
   const reasons = new Map();
   const trail = [];
+  const overrideMap = new Map(overrides);
   let steps = 0;
   let conflict = null;
 
@@ -694,6 +710,14 @@ function resolveTree(rootDependencies) {
       reasons.set(name, { contract, by });
     }
     requirements.push({ contract, by });
+  }
+
+  // An override replaces every requirement on that name: the pinned contract
+  // is the only constraint that applies, wherever the name was required.
+  function effectiveRequirements(name) {
+    const override = overrideMap.get(name);
+    if (override === undefined) return edges.get(name);
+    return [{ contract: override, by: 'opurom.json (override)' }];
   }
 
   function snapshot() {
@@ -722,7 +746,7 @@ function resolveTree(rootDependencies) {
   // Registry versions satisfying every recorded requirement, highest first.
   // An exact pin whose package is absent reports the missing path directly.
   function candidates(name) {
-    const requirements = edges.get(name);
+    const requirements = effectiveRequirements(name);
     const pinned = requirements.find(({ contract }) => parseRange(contract).exact);
     if (pinned !== undefined) {
       const version = parseRange(pinned.contract).version.raw;
@@ -739,7 +763,9 @@ function resolveTree(rootDependencies) {
 
   function choiceHolds(name) {
     const version = chosen.get(name);
-    return edges.get(name).every(({ contract }) => satisfies(version, parseRange(contract)));
+    return effectiveRequirements(name).every(({ contract }) =>
+      satisfies(version, parseRange(contract)),
+    );
   }
 
   function noteConflict(name, index) {
@@ -747,14 +773,12 @@ function resolveTree(rootDependencies) {
       conflict = {
         name,
         index,
-        requirements: [...edges.get(name)],
+        requirements: [...effectiveRequirements(name)],
         trail: [...trail],
       };
     }
   }
 
-  // Walk the assignment trail back to the package that introduced a requirer,
-  // so each conflicting requirement reads as a cause chain from the manifest.
   // Walk the assignment trail back through each requirer's own cause, so a
   // conflict reads as one chain from the manifest instead of a flat list.
   function derivation(requirement, history) {
@@ -810,7 +834,13 @@ function resolveTree(rootDependencies) {
     return false;
   }
 
-  for (const [name, contract] of rootDependencies) record(name, contract, 'opurom.json');
+  for (const [name, contract] of rootDependencies) {
+    if (overrideMap.has(name)) continue;
+    record(name, contract, 'opurom.json');
+  }
+  for (const [name, contract] of overrideMap) {
+    record(name, contract, 'opurom.json (override)');
+  }
   if (!search(0)) {
     if (conflict !== null) {
       const lines = [`dependency conflict: ${conflict.name}`];
@@ -837,8 +867,8 @@ function resolveTree(rootDependencies) {
 }
 
 // The lock records resolved files only; requirement edges stay in the manifests.
-function buildPackages(dependencies) {
-  return resolveTree(dependencies)
+function buildPackages(dependencies, overrides = []) {
+  return resolveTree(dependencies, overrides)
     .map(({ name, version }) => collectPackage(name, version))
     .sort(comparePackages);
 }
@@ -897,13 +927,13 @@ function commandInit(name) {
 
 // Updates opurom.json and opurom.lock after a dependency became available locally.
 function applyDependency(name, version) {
-  const { data, dependencies, devDependencies } = readManifestFile();
+  const { data, dependencies, devDependencies, overrides } = readManifestFile();
   const byName = new Map(dependencies);
   byName.set(name, version);
   const nextDependencies = [...byName].sort((left, right) =>
     compareStrings(left[0], right[0]),
   );
-  const packages = buildPackages([...nextDependencies, ...devDependencies]);
+  const packages = buildPackages([...nextDependencies, ...devDependencies], overrides);
   writeProjectState(data, nextDependencies, packages);
   return packages.find((pkg) => pkg.name === name);
 }
@@ -916,19 +946,19 @@ function commandAdd(contract) {
 
 function commandRemove(name) {
   validateName(name, 'package name');
-  const { data, dependencies, devDependencies } = readManifestFile();
+  const { data, dependencies, devDependencies, overrides } = readManifestFile();
   if (!dependencies.some(([dependencyName]) => dependencyName === name)) {
     throw new CliError(`unknown dependency: ${name}`);
   }
   const nextDependencies = dependencies.filter(([dependencyName]) => dependencyName !== name);
-  const packages = buildPackages([...nextDependencies, ...devDependencies]);
+  const packages = buildPackages([...nextDependencies, ...devDependencies], overrides);
   writeProjectState(data, nextDependencies, packages);
   process.stdout.write(`removed ${name} (${packages.length} packages remain)\n`);
 }
 
 function commandLock() {
-  const { root } = readManifestFile();
-  const packages = buildPackages(root);
+  const { root, overrides } = readManifestFile();
+  const packages = buildPackages(root, overrides);
   writeLock(packages);
   process.stdout.write(`regenerated opurom.lock (${packages.length} packages)\n`);
 }
@@ -939,8 +969,8 @@ function commandLockCheck() {
   if (!existsSync(lockPath)) {
     throw new CliError('missing opurom.lock; run lock first');
   }
-  const { root } = readManifestFile();
-  const packages = buildPackages(root);
+  const { root, overrides } = readManifestFile();
+  const packages = buildPackages(root, overrides);
   const expected = stableJson(lockData(packages));
   const actual = readNoFollow(lockPath, 'opurom.lock', 'utf8');
   if (actual !== expected) {
@@ -999,7 +1029,7 @@ function commandOutdated() {
     ]),
   );
   const wanted = new Map(
-    resolveTree(manifest.root).map((entry) => [entry.name, entry.version]),
+    resolveTree(manifest.root, manifest.overrides).map((entry) => [entry.name, entry.version]),
   );
   const rows = [['NAME', 'LOCKED', 'WANTED', 'LATEST']];
   for (const pkg of lockedPackages) {
@@ -1014,8 +1044,10 @@ function commandOutdated() {
   printRows(rows);
 }
 
-function manifestDriftErrors(dependencies, packages) {
+function manifestDriftErrors(dependencies, overrides, packages) {
   const expected = new Map(dependencies);
+  // An override replaces the declared contract on that name everywhere.
+  for (const [name, contract] of overrides) expected.set(name, contract);
   const locked = new Map(packages.map((pkg) => [pkg.name, pkg.version]));
   const errors = [];
   for (const [name, contract] of expected) {
@@ -1033,7 +1065,7 @@ function manifestDriftErrors(dependencies, packages) {
   if (errors.length > 0) return errors;
   let resolved;
   try {
-    resolved = resolveTree(dependencies);
+    resolved = resolveTree(dependencies, overrides);
   } catch (error) {
     return [errorText(error)];
   }
@@ -1114,7 +1146,7 @@ function commandVerify() {
     {
       label: '<manifest>',
       detail: 'dependencies match opurom.lock',
-      errors: manifestDriftErrors(manifest.root, packages),
+      errors: manifestDriftErrors(manifest.root, manifest.overrides, packages),
     },
   ];
   for (const pkg of packages) {

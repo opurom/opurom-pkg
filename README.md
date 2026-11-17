@@ -241,7 +241,10 @@ order, an up-to-date project and a missing registry package.
 - Local `add`, `lock` and `verify` accept exact SemVer 2.0 pins, `^` caret ranges, `any`, or
   comparator ranges; ranges pin the highest version the whole tree allows in the lock. `any` also
   admits prereleases. An optional root `devDependencies` map resolves into the lock like direct
-  dependencies; dev dependencies declared by dependency packages are ignored. `publish` uses exact versions; `install` takes an
+  dependencies; dev dependencies declared by dependency packages are ignored. An optional root
+  `dependencyOverrides` map replaces every constraint on that name in the graph, including the
+  root's own declaration; only the root manifest's overrides apply. Lock bytes are unchanged for
+  projects without these fields. `publish` uses exact versions; `install` takes an
   exact version and resolves its transitive closure by range. Transitive requirements resolve from
   each package's registry manifest; unsatisfiable requirements fail with a conflict report.
 - `update check`/`fetch` form the OTA channel: read-only reporting and verified bundle fetch only.
