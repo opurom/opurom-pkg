@@ -121,3 +121,57 @@ test('verify reports lock gaps for transitive packages', (t) => {
   assert.notEqual(driftResult.status, 0);
   assert.match(driftResult.output, /version drift: tree-lib expected 2\.0\.0, lock has 1\.5\.0/);
 });
+
+test('a direct conflict reports a Because cause chain and stays byte-stable', (t) => {
+  const root = project(t, { 'tree-a': '1.0.0', 'tree-b': '1.0.0' });
+  writePackage(root, 'tree-a', '1.0.0', { 'tree-b': '>=2.0.0' });
+  writePackage(root, 'tree-b', '1.0.0');
+  writePackage(root, 'tree-b', '2.0.0');
+
+  const first = run(root, 'lock');
+  assert.notEqual(first.status, 0);
+  assert.match(first.output, /dependency conflict: tree-b/);
+  assert.match(first.output, /Because opurom\.json requires 1\.0\.0/);
+  assert.match(first.output, /and opurom\.json requires tree-a@1\.0\.0 via 1\.0\.0/);
+  assert.match(first.output, /and tree-a@1\.0\.0 requires >=2\.0\.0/);
+  assert.match(first.output, /no version of tree-b satisfies all constraints/);
+
+  const second = run(root, 'lock');
+  assert.equal(second.output, first.output);
+});
+
+test('a two-level conflict traces every requirer back to the manifest', (t) => {
+  const root = project(t, { 'tree-a': '1.0.0', 'tree-c': '1.0.0' });
+  writePackage(root, 'tree-a', '1.0.0', { 'tree-b': '2.0.0' });
+  writePackage(root, 'tree-b', '2.0.0', { 'tree-x': '>=2.0.0' });
+  writePackage(root, 'tree-c', '1.0.0', { 'tree-x': '1.0.0' });
+  writePackage(root, 'tree-x', '1.0.0');
+  writePackage(root, 'tree-x', '2.0.0');
+
+  const result = run(root, 'lock');
+  assert.notEqual(result.status, 0);
+  assert.match(result.output, /dependency conflict: tree-x/);
+  assert.match(result.output, /Because opurom\.json requires tree-c@1\.0\.0 via 1\.0\.0/);
+  assert.match(result.output, /and tree-c@1\.0\.0 requires 1\.0\.0/);
+  assert.match(result.output, /and opurom\.json requires tree-a@1\.0\.0 via 1\.0\.0/);
+  assert.match(result.output, /and tree-a@1\.0\.0 requires tree-b@2\.0\.0 via 2\.0\.0/);
+  assert.match(result.output, /and tree-b@2\.0\.0 requires >=2\.0\.0/);
+  assert.match(result.output, /no version of tree-x satisfies all constraints/);
+});
+
+test('a conflicting dependency cycle reports a finite cause chain', (t) => {
+  const root = project(t, { 'tree-a': '1.0.0' });
+  writePackage(root, 'tree-a', '1.0.0', { 'tree-b': '2.0.0' });
+  writePackage(root, 'tree-b', '2.0.0', { 'tree-a': '<1.0.0' });
+
+  const first = run(root, 'lock');
+  assert.notEqual(first.status, 0);
+  assert.match(first.output, /dependency conflict: tree-a/);
+  assert.match(first.output, /Because opurom\.json requires 1\.0\.0/);
+  assert.match(first.output, /and opurom\.json requires tree-a@1\.0\.0 via 1\.0\.0/);
+  assert.match(first.output, /and tree-a@1\.0\.0 requires tree-b@2\.0\.0 via 2\.0\.0/);
+  assert.match(first.output, /and tree-b@2\.0\.0 requires <1\.0\.0/);
+
+  const second = run(root, 'lock');
+  assert.equal(second.output, first.output);
+});

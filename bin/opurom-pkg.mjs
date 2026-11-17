@@ -658,6 +658,8 @@ function resolveTree(rootDependencies) {
   const edges = new Map();
   const order = [];
   const chosen = new Map();
+  const reasons = new Map();
+  const trail = [];
   let steps = 0;
   let conflict = null;
 
@@ -667,6 +669,7 @@ function resolveTree(rootDependencies) {
       requirements = [];
       edges.set(name, requirements);
       order.push(name);
+      reasons.set(name, { contract, by });
     }
     requirements.push({ contract, by });
   }
@@ -676,6 +679,8 @@ function resolveTree(rootDependencies) {
       order: [...order],
       edges: new Map([...edges].map(([name, list]) => [name, [...list]])),
       chosen: new Map(chosen),
+      reasons: new Map(reasons),
+      trail: [...trail],
     };
   }
 
@@ -686,6 +691,10 @@ function resolveTree(rootDependencies) {
     for (const [name, list] of state.edges) edges.set(name, list);
     chosen.clear();
     for (const [name, version] of state.chosen) chosen.set(name, version);
+    reasons.clear();
+    for (const [name, requirement] of state.reasons) reasons.set(name, requirement);
+    trail.length = 0;
+    trail.push(...state.trail);
   }
 
   // Registry versions satisfying every recorded requirement, highest first.
@@ -713,8 +722,37 @@ function resolveTree(rootDependencies) {
 
   function noteConflict(name, index) {
     if (conflict === null || index > conflict.index) {
-      conflict = { name, index, requirements: [...edges.get(name)] };
+      conflict = {
+        name,
+        index,
+        requirements: [...edges.get(name)],
+        trail: [...trail],
+      };
     }
+  }
+
+  // Walk the assignment trail back to the package that introduced a requirer,
+  // so each conflicting requirement reads as a cause chain from the manifest.
+  // Walk the assignment trail back through each requirer's own cause, so a
+  // conflict reads as one chain from the manifest instead of a flat list.
+  function derivation(requirement, history) {
+    const entries = new Map(
+      history.map((entry) => [`${entry.name}@${entry.version}`, entry]),
+    );
+    const lines = [];
+    const walk = (by, seen) => {
+      if (by === 'opurom.json') return;
+      const entry = entries.get(by);
+      if (entry === undefined || seen.has(by)) return;
+      seen.add(by);
+      walk(entry.requirement.by, seen);
+      lines.push(
+        `${entry.requirement.by} requires ${entry.name}@${entry.version} via ${entry.requirement.contract}`,
+      );
+    };
+    walk(requirement.by, new Set());
+    lines.push(`${requirement.by} requires ${requirement.contract}`);
+    return lines;
   }
 
   function search(index) {
@@ -732,6 +770,7 @@ function resolveTree(rootDependencies) {
       }
       const before = snapshot();
       chosen.set(name, version);
+      trail.push({ name, version, requirement: reasons.get(name) });
       let consistent = true;
       for (const [dependency, contract] of registryDependencies(name, version)) {
         record(dependency, contract, `${name}@${version}`);
@@ -753,8 +792,19 @@ function resolveTree(rootDependencies) {
   if (!search(0)) {
     if (conflict !== null) {
       const lines = [`dependency conflict: ${conflict.name}`];
-      for (const { contract, by } of conflict.requirements) {
-        lines.push(`  ${by} requires ${contract}`);
+      const chain = [];
+      for (const requirement of conflict.requirements) {
+        chain.push(...derivation(requirement, conflict.trail));
+      }
+      if (chain.length === 0) {
+        // Fallback: the deepest empty candidate still reports its requirers.
+        for (const { contract, by } of conflict.requirements) {
+          lines.push(`  ${by} requires ${contract}`);
+        }
+      } else {
+        chain.forEach((line, index) => {
+          lines.push(`  ${index === 0 ? 'Because' : 'and'} ${line}`);
+        });
       }
       lines.push(`  no version of ${conflict.name} satisfies all constraints`);
       throw new CliError(lines.join('\n'));
