@@ -249,3 +249,62 @@ test('a tampered lockfile signature is refused', (t) => {
   assert.notEqual(result.status, 0);
   assert.match(result.output, /invalid signature: opurom\.lock\.sig/);
 });
+
+test('caret constraints use the next breaking major boundary', (t) => {
+  const range = parseRange('^1.2.3');
+  assert.deepEqual(
+    range.comparators.map((comparator) => `${comparator.operator}${comparator.version.raw}`),
+    ['>=1.2.3', '<2.0.0'],
+  );
+  assert.equal(satisfies('1.2.3', range), true);
+  assert.equal(satisfies('1.9.9', range), true);
+  assert.equal(satisfies('2.0.0', range), false);
+  assert.equal(satisfies('2.0.0-preview.1', range), false);
+
+  const root = rangedProject(t, ['1.2.3', '1.9.0', '2.0.0'], '^1.2.3');
+  ok(root, 'lock');
+  assert.equal(lockedVersion(root), '1.9.0');
+  assert.match(ok(root, 'verify').stdout, /2\/2 checks passed/);
+  assert.match(ok(root, 'lock', '--check').stdout, /up to date \(1 packages\)/);
+});
+
+test('caret constraints bump minor while major is zero, including 0.0.x', () => {
+  const minor = parseRange('^0.2.3');
+  assert.deepEqual(
+    minor.comparators.map((comparator) => comparator.version.raw),
+    ['0.2.3', '0.3.0'],
+  );
+  assert.equal(satisfies('0.2.9', minor), true);
+  assert.equal(satisfies('0.3.0', minor), false);
+
+  const patch = parseRange('^0.0.5');
+  assert.deepEqual(
+    patch.comparators.map((comparator) => comparator.version.raw),
+    ['0.0.5', '0.1.0'],
+  );
+  assert.equal(satisfies('0.0.9', patch), true);
+  assert.equal(satisfies('0.1.0', patch), false);
+  assert.equal(satisfies('0.0.4', patch), false);
+});
+
+test('caret accepts one version and rejects a trailing constraint', (t) => {
+  for (const contract of ['^1.2.3 <2.0.0', '^01.2.3', '^', '^1.2.3 || ^2.0.0']) {
+    assert.equal(parseRange(contract), null, contract);
+  }
+  const root = rangedProject(t, ['1.2.3', '2.0.0'], '^1.2.3');
+  const result = run(root, 'add', `${NAME}@^1.2.3 <2.0.0`);
+  assert.notEqual(result.status, 0);
+  assert.match(result.output, /invalid version/);
+  assert.match(result.output, /\^x\.y\.z \(alone\)/);
+});
+
+test('an existing exact-pin lock keeps its bytes and resolution', (t) => {
+  const root = rangedProject(t, ['1.0.0', '1.9.0', '2.0.0'], '1.0.0');
+  ok(root, 'lock');
+  const before = readFileSync(path.join(root, 'opurom.lock'), 'utf8');
+  assert.equal(lockedVersion(root), '1.0.0');
+  assert.match(ok(root, 'verify').stdout, /2\/2 checks passed/);
+  assert.match(ok(root, 'lock', '--check').stdout, /up to date \(1 packages\)/);
+  ok(root, 'lock');
+  assert.equal(readFileSync(path.join(root, 'opurom.lock'), 'utf8'), before);
+});

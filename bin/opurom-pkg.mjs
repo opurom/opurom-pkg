@@ -378,7 +378,7 @@ function validateVersion(version, label) {
 function validateDependencySpec(contract, label) {
   if (!parseRange(contract)) {
     throw new CliError(
-      `invalid version for ${label}: ${String(contract)}; use SemVer 2.0 x.y.z or a comparator range`,
+      `invalid version for ${label}: ${String(contract)}; use SemVer 2.0 x.y.z, ^x.y.z (alone), or a comparator range`,
     );
   }
 }
